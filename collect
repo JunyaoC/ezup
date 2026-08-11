@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Pick Claude sessions from a time window, then build a journal from them.
+#
+#   ./collect                        every project, last 7 days
+#   ./collect 30d                    every project, last 30 days
+#   ./collect 2026-08-01             every project, since that date
+#   ./collect 2026-08-01..2026-08-07 every project, that date range
+#   ./collect ~/code/proj            one project, last 7 days
+#   ./collect ~/code/proj 30d        one project, last 30 days
+#   ./collect 7d --stop-before-model ... plus any ezcl flag
+#
+# Directory and window can appear in either order; both are optional.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+DIRS=()
+SINCE="7d"
+UNTIL=""
+
+is_window() {
+  # 7d / 24h / 2w, a date, a timestamp, or a start..end range
+  [[ "$1" =~ ^[0-9]+(\.[0-9]+)?[smhdwSMHDW]$ ]] && return 0
+  [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]] && return 0
+  return 1
+}
+
+while [[ $# -gt 0 && "$1" != -* ]]; do
+  if [[ "$1" == *".."* ]] && is_window "${1%%..*}"; then
+    SINCE="${1%%..*}"
+    UNTIL="${1##*..}"
+  elif is_window "$1"; then
+    SINCE="$1"
+  else
+    DIRS+=("$1")
+  fi
+  shift
+done
+
+ARGS=(collect)
+[[ ${#DIRS[@]} -gt 0 ]] && ARGS+=("${DIRS[@]}")
+ARGS+=(--since "$SINCE")
+[[ -n "$UNTIL" ]] && ARGS+=(--until "$UNTIL")
+ARGS+=(--interactive --limit 0)
+
+# Prefer the project venv; fall back to system python so the script still runs
+# on a machine where setup.sh has not been run.
+if [ -x "$HERE/.venv/bin/python" ]; then
+  PY="$HERE/.venv/bin/python"
+elif command -v uv >/dev/null 2>&1 && [ -f "$HERE/pyproject.toml" ] && [ -d "$HERE/.venv" ]; then
+  PY="uv run --project $HERE python"
+else
+  PY="python3"
+fi
+
+exec env PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}" \
+  $PY -m ezchangelog "${ARGS[@]}" "$@"

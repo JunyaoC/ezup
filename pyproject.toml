@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ez-change-log"
+version = "0.1.0"
+description = "Turn Claude Code session history into changelogs and reports"
+readme = "README.md"
+requires-python = ">=3.10"
+# Intentionally none: the pipeline shells out to the `claude` CLI rather than
+# depending on an SDK, and everything else is stdlib.
+dependencies = []
+
+[project.scripts]
+ezcl = "ezchangelog.cli:main"
+
+[tool.setuptools]
+packages = ["ezchangelog"]
