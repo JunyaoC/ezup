@@ -2197,12 +2197,80 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Commands that Claude Code's hook fires on every turn. They must stay fast,
+# work offline, and never swap the code out from under a live session, so the
+# auto-update is skipped for them.
+_HOT_PATH_COMMANDS = frozenset({"publish", "unpublish", "hook-run", "statusline"})
+
+
+def _git_head(repo: Path) -> str:
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        return out.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _self_update(argv: list[str]) -> None:
+    """Best-effort ``git pull`` of the install repo before a human command.
+
+    ezup is installed editable — the ``ezup`` on PATH is a symlink into this
+    repo's venv — so pulling the repo updates the code in place. If HEAD moves
+    we re-exec so the current command runs on the freshly pulled code.
+
+    Deliberately unobtrusive: any failure (offline, no git, not a checkout,
+    diverged or dirty tree that can't fast-forward) is swallowed and the real
+    command runs regardless. Set ``EZUP_NO_UPDATE=1`` to turn it off.
+    """
+    import shutil
+    import subprocess
+
+    if os.environ.get("EZUP_NO_UPDATE") or os.environ.get("_EZUP_UPDATED"):
+        return
+    command = next((a for a in argv if not a.startswith("-")), "")
+    if command in _HOT_PATH_COMMANDS:
+        return
+    if not shutil.which("git"):
+        return
+    repo = Path(__file__).resolve().parent.parent
+    if not (repo / ".git").is_dir():
+        return
+
+    before = _git_head(repo)
+    try:
+        subprocess.run(
+            ["git", "-C", str(repo), "pull", "--ff-only", "--quiet"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=10, check=False,
+        )
+    except Exception:
+        return
+    after = _git_head(repo)
+    if not after or after == before:
+        return
+
+    print(f"\033[2m↻ ezup updated {before[:7]}→{after[:7]}\033[0m", file=sys.stderr)
+    # Re-exec on the new code so this very invocation reflects the update. The
+    # guard env var stops the fresh process from pulling (and re-execing) again.
+    os.environ["_EZUP_UPDATED"] = "1"
+    try:
+        os.execv(sys.executable, [sys.executable, "-m", "ezchangelog", *argv])
+    except Exception:
+        pass  # couldn't re-exec — fall through and run the old code this once
+
+
 def main(argv: list[str] | None = None) -> int:
     # Die quietly when piped into `head` instead of dumping a BrokenPipeError.
     try:
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     except (AttributeError, ValueError):
         pass
+    _self_update(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(argv)
     return int(args.func(args))
