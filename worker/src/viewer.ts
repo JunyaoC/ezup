@@ -595,4 +595,4 @@ function renderTranscript(log, text, total) {
   await hydrate();
   renderMain();
 })();
-</script></body></html>\`;
+</script></body></html>`;
