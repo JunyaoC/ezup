@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import inspect
 import json
 import os
 import signal
@@ -12,6 +14,14 @@ from pathlib import Path
 from typing import Any
 
 from . import hook_entry, hooks, picker, share
+from .crypto import (
+    CryptoError,
+    bearer_sha256,
+    generate_key,
+    parse_key,
+    unwrap_dk,
+    wrap_dk,
+)
 from .collect import CollectResult, Selection, collect, normalize_roots
 from .config import PullView, load_config, transport_for
 from .console import Console
@@ -20,9 +30,9 @@ from .pipeline import STAGES as pipeline_stages_const, run_pipeline
 
 def pipeline_stages() -> list[str]:
     return list(pipeline_stages_const)
-from .publish import PublishState, publish as publish_session
+from .publish import PublishState, publish as publish_session, readers_path
 from .pull import pull as pull_sessions, pulled_sessions
-from .store import Store, default_store
+from .store import Store, _write_json_atomic, default_store
 from .transcripts import CLAUDE_PROJECTS_DIR, SessionFacts, scan_transcript
 from .transport import HttpTransport, SessionMeta, TransportError
 from .window import end_of_day, isoformat, since_to_datetime
@@ -884,6 +894,212 @@ def cmd_sync(args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+# -- reader tokens ------------------------------------------------------------
+
+
+def _read_json_file(path: Path) -> dict[str, Any]:
+    """Best-effort JSON read; a missing or corrupt file is "no data", not fatal."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _readers(store: Store) -> list[dict[str, Any]]:
+    data = _read_json_file(readers_path(store))
+    rows = data.get("readers")
+    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+
+def _write_readers(store: Store, rows: list[dict[str, Any]]) -> None:
+    """Persist readers.json machine-private (0600): it carries each reader's
+    K_enc, which lets this device wrap DKs *to* the reader forever. It never
+    authenticates *as* the reader (K_auth is HKDF-independent), but it is still
+    key material and must not be world-readable or land in a repo."""
+    path = readers_path(store)
+    _write_json_atomic(path, {"version": 1, "readers": rows})
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _grant_history(
+    transport: HttpTransport,
+    reader_id: str,
+    reader_enc_key: bytes,
+    say: Any,
+) -> tuple[int, list[tuple[str, str]]]:
+    """Re-wrap every session's data key for a freshly minted reader.
+
+    This is the O(sessions) backfill the contract describes (D8 / 6.3 step 4).
+    Every session's DK is already wrapped for this device itself and stored
+    server-side, so the device recovers each DK from its own self-wrap and
+    re-wraps it under the reader's K_enc -- no need to have kept any DK locally.
+
+    Returns ``(granted, skipped)`` where ``skipped`` names the sessions whose
+    self-wrap could not be opened (reported, never fatal).
+    """
+    # Bulk fetch of THIS device's own wraps. The GET response also carries the
+    # caller's recipient_id, which HttpTransport caches into device_id -- so
+    # this call is what teaches us the own-device id the self-wrap AAD is bound
+    # to when the config did not already carry it.
+    self_wraps = transport.get_wrapped_keys()
+    own_id = transport.device_id
+    if not own_id:
+        # No self-wraps and no configured id: nothing to unwrap against, so the
+        # backfill is a no-op rather than an error (a device that has published
+        # nothing encrypted has no history to grant).
+        return 0, []
+
+    device_key = transport.key_set  # the configured ezu_ device key (guaranteed by caller)
+    batch: list[dict[str, Any]] = []
+    skipped: list[tuple[str, str]] = []
+    for wrap in self_wraps:
+        session = str(wrap.get("session") or "")
+        try:
+            enc_gen = int(wrap.get("enc_gen") or 0)
+            blob = base64.b64decode(str(wrap.get("wrap") or ""))
+            dk = unwrap_dk(device_key.enc_key, session, own_id, enc_gen, blob)
+        except (CryptoError, ValueError, TypeError) as exc:
+            # A self-wrap we cannot open cannot be re-granted; skip it loudly so
+            # the developer knows that one session will not be readable by the
+            # new reader, and move on rather than aborting the whole grant.
+            skipped.append((session, str(exc)))
+            continue
+        rewrapped = wrap_dk(reader_enc_key, session, reader_id, enc_gen, dk)
+        batch.append(
+            {
+                "session": session,
+                "recipient_id": reader_id,
+                "enc_gen": enc_gen,
+                "wrap": base64.b64encode(rewrapped).decode("ascii"),
+            }
+        )
+
+    if not batch:
+        return 0, skipped
+    say(f"granting {len(batch)} session(s) to the new reader...")
+    granted = transport.put_wrapped_keys(batch)  # batched <= 500 inside the transport
+    return granted, skipped
+
+
+def _mint_reader(
+    args: argparse.Namespace,
+    store: Store,
+    transport: HttpTransport,
+    say: Any,
+) -> int:
+    """Client-side reader mint + history backfill (contract 6.3).
+
+    The reader secret is generated here and never sent; the server stores only
+    sha256 of its derived bearer, so it can authenticate the reader later
+    without ever being able to become it.
+    """
+    key_set = transport.key_set
+    if key_set is None or key_set.kind != "device":
+        # Minting a reader and wrapping DKs for it both require this machine's
+        # own device key: the wire call needs a device bearer, and the backfill
+        # needs the device's K_enc to open its self-wraps. A reader key or a raw
+        # ezw_ bearer can do neither.
+        print(
+            "error: `ezup token mint` needs this machine's device key (the "
+            "pasted ezu_ key) configured as the store token; a reader key or a "
+            "raw bearer cannot mint readers or wrap data keys for them",
+            file=sys.stderr,
+        )
+        return 2
+
+    # 1. Generate the reader's key on the client. Printed once at the end.
+    pasted, reader_keys = generate_key("reader")
+
+    # 2. Register only sha256(bearer) with the server; get back the reader's
+    #    recipient device id (used as the wrap AAD recipient from here on).
+    try:
+        response = transport.mint_reader(args.name, bearer_sha256(pasted))
+    except TransportError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    reader_id = str(response.get("id") or "")
+    if not reader_id:
+        print("error: the store did not return a reader id", file=sys.stderr)
+        return 1
+
+    # 3. Record the grant locally so future publishes keep wrapping for it.
+    rows = _readers(store)
+    rows.append(
+        {
+            "reader_id": reader_id,
+            "name": args.name,
+            "keyid": reader_keys.keyid,
+            "enc_key": reader_keys.enc_key.hex(),
+            "created_at": isoformat(datetime.now(timezone.utc)),
+        }
+    )
+    _write_readers(store, rows)
+
+    # 4. History backfill: re-wrap every existing session's DK for the reader.
+    try:
+        granted, skipped = _grant_history(
+            transport, reader_id, reader_keys.enc_key, say
+        )
+    except TransportError as error:
+        # The reader exists and readers.json is written, so future sessions are
+        # already covered; only the backfill of past sessions failed. Say so
+        # precisely rather than pretending the mint failed.
+        print(
+            f"error: reader minted, but granting existing sessions failed: "
+            f"{error}. Re-run `ezup token mint` is not needed; a fresh publish "
+            f"of each session will grant it, or retry when the store is reachable.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.json:
+        json.dump(
+            {
+                "reader_id": reader_id,
+                "name": args.name,
+                "keyid": reader_keys.keyid,
+                "token": pasted,
+                "granted": granted,
+                "skipped": [s for s, _ in skipped],
+            },
+            sys.stdout,
+            indent=2,
+        )
+        sys.stdout.write("\n")
+        return 0
+
+    # The pasted key is shown exactly once and stored nowhere on this machine.
+    print(f"reader token for {args.name} (keyid {reader_keys.keyid[:8]}):")
+    print()
+    print(f"    {pasted}")
+    print()
+    print(
+        "copy it now -- it is shown ONCE and is stored nowhere on this machine. "
+        "Send it to the reader over a private channel."
+    )
+    print(
+        f"they can read every session you have shared "
+        f"({granted} granted just now) and every session you share from now on, "
+        f"until you run:"
+    )
+    print(f"    ezup token revoke {args.name}")
+    if skipped:
+        print()
+        print(
+            f"WARNING {len(skipped)} session(s) could not be granted (their "
+            f"self-wrap would not open); they will not be readable by this reader:"
+        )
+        for session, reason in skipped[:5]:
+            print(f"  {session[:16]:<18}{reason}")
+        if len(skipped) > 5:
+            print(f"  ... {len(skipped) - 5} more")
+    return 0
+
+
 # -- pull ---------------------------------------------------------------------
 
 
@@ -932,22 +1148,12 @@ def cmd_token(args: argparse.Namespace) -> int:
 
     try:
         if args.token_command == "mint":
-            minted = transport.mint_reader(args.name)
-            token = str(minted.get("token") or "")
-            _emit(
-                minted,
-                args.json,
-                [
-                    f"reader token for {args.name!r} — shown once, never again:",
-                    "",
-                    f"  {token}",
-                    "",
-                    f"grants: {minted.get('grants', 'read-only access to your sessions')}",
-                    "the operator uses it as EZUPDATE_TOKEN with the same store URL",
-                    f"revoke any time: ezup token revoke {args.name}",
-                ],
-            )
-            return 0
+            # --json keeps stdout machine-readable, so progress prose goes to
+            # stderr there rather than being dropped.
+            def say(message: str) -> None:
+                print(message, file=sys.stderr if args.json else sys.stdout)
+
+            return _mint_reader(args, store, transport, say)
         if args.token_command == "list":
             rows = transport.list_readers()
             lines = [f"{len(rows)} reader token(s) minted by this device"]
@@ -990,10 +1196,21 @@ def cmd_token(args: argparse.Namespace) -> int:
                 return 2
             target = matches[0]
         gone = transport.revoke_reader(str(target.get("id")))
+        # Drop the local grant too, so future publishes stop wrapping DKs for a
+        # reader the server will now refuse anyway. Match on the revoked id.
+        target_id = str(target.get("id"))
+        rows = _readers(store)
+        remaining = [r for r in rows if str(r.get("reader_id")) != target_id]
+        if len(remaining) != len(rows):
+            _write_readers(store, remaining)
         _emit(
             gone,
             args.json,
-            [f"revoked {target.get('name','?')} ({target.get('id','?')}); that token stops working now"],
+            [
+                f"revoked {target.get('name','?')} ({target.get('id','?')}); that "
+                f"token stops working now. Already-published DKs it holds stay "
+                f"decryptable until each session's generation rotates (contract Q1)."
+            ],
         )
         return 0
     except TransportError as error:
@@ -1001,8 +1218,192 @@ def cmd_token(args: argparse.Namespace) -> int:
         return 1
 
 
+# -- keyring ------------------------------------------------------------------
+# The reader keyring lives in ezchangelog/keyring.py, owned by another module.
+# It is imported lazily and every access is defensive, so a build without it
+# (or an older one) keeps `pull` working on the single configured device token
+# and simply reports keyring commands as unavailable -- never an import-time
+# failure that would take the whole CLI down with it.
+
+
+def _keyring_module() -> Any | None:
+    try:
+        from . import keyring as module  # type: ignore
+    except Exception:
+        return None
+    return module
+
+
+def _load_keyring(store: Store) -> Any | None:
+    module = _keyring_module()
+    if module is None:
+        return None
+    loader = getattr(module, "load_keyring", None)
+    if not callable(loader):
+        return None
+    try:
+        return loader(store)
+    except Exception:
+        return None
+
+
+def _entry_field(entry: Any, name: str, default: str = "") -> str:
+    """One field of a keyring entry, tolerating both dict and dataclass shapes."""
+    if isinstance(entry, dict):
+        return str(entry.get(name, default) or default)
+    return str(getattr(entry, name, default) or default)
+
+
+def _keyring_entries(keyring: Any) -> list[Any]:
+    """The reader entries a Keyring holds.
+
+    The stored schema is pinned by the contract (6.5: token/keyid/reader_id/
+    label/store), so the pull loop reads entries directly rather than depending
+    on method names that may still be settling. Tries the likely container
+    attributes in turn.
+    """
+    if keyring is None:
+        return []
+    for attr in ("entries", "keys", "readers"):
+        value = getattr(keyring, attr, None)
+        if isinstance(value, list):
+            return value
+    if isinstance(keyring, list):
+        return keyring
+    return []
+
+
+def _call_pull(
+    view: Any,
+    store: Store,
+    *,
+    since: str | None,
+    authors: list[str] | None,
+    keyid: str | None,
+    allow_legacy: bool,
+) -> Any:
+    """Invoke pull, passing only the keyword arguments this pull build accepts.
+
+    ``keyid`` (per-key cursor scoping) and ``allow_legacy`` (show unverified
+    legacy plaintext) are forwarded only when the installed ``pull`` declares
+    them, so this CLI stays compatible with a pull module that has not yet
+    grown either parameter.
+    """
+    params = inspect.signature(pull_sessions).parameters
+    kwargs: dict[str, Any] = {"since": since, "authors": authors}
+    if "keyid" in params:
+        kwargs["keyid"] = keyid
+    if "allow_legacy" in params:
+        kwargs["allow_legacy"] = allow_legacy
+    return pull_sessions(view, store, **kwargs)
+
+
+def _resolve_since(args: argparse.Namespace) -> str | None | bool:
+    """The --since instant, or False on a parse error (already reported)."""
+    if not args.since:
+        return None
+    try:
+        return isoformat(since_to_datetime(args.since, datetime.now(timezone.utc)))
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return False
+
+
+def _pull_keyring(
+    args: argparse.Namespace, store: Store, entries: list[Any], allow_legacy: bool
+) -> int:
+    """Run the existing pull once per keyring entry, against each entry's store.
+
+    Cursors are scoped per key (contract 6.5): one revoked key reports its own
+    error and holds only its own cursor, while the other keys complete. The
+    union of every key's sessions lands under ``<store>/pulled/<author>/``.
+    """
+    since = _resolve_since(args)
+    if since is False:
+        return 2
+
+    totals = {"sessions_new": 0, "sessions_updated": 0, "chunks": 0, "bytes": 0}
+    all_errors: list[str] = []
+    per_key: list[dict[str, Any]] = []
+
+    for entry in entries:
+        token = _entry_field(entry, "token")
+        keyid = _entry_field(entry, "keyid")
+        label = _entry_field(entry, "label") or keyid[:8] or "reader"
+        store_url = _entry_field(entry, "store")
+        reader_id = _entry_field(entry, "reader_id")
+        tag = f"{label} ({keyid[:8]})" if keyid else label
+
+        if not token or not store_url:
+            all_errors.append(f"{tag}: keyring entry is missing its token or store")
+            per_key.append({"key": label, "keyid": keyid, "error": "incomplete entry"})
+            continue
+
+        try:
+            transport = HttpTransport(store_url, token, device_id=reader_id)
+        except TransportError as error:
+            all_errors.append(f"{tag}: {error}")
+            per_key.append({"key": label, "keyid": keyid, "error": str(error)})
+            continue
+
+        report = _call_pull(
+            PullView(transport),
+            store,
+            since=since,  # type: ignore[arg-type]
+            authors=args.author,
+            keyid=keyid or None,
+            allow_legacy=allow_legacy,
+        )
+        totals["sessions_new"] += report.sessions_new
+        totals["sessions_updated"] += report.sessions_updated
+        totals["chunks"] += report.chunks
+        totals["bytes"] += report.bytes
+        # Per-key error prefix so a revoked key is named, not anonymous.
+        all_errors += [f"{tag}: {problem}" for problem in report.errors]
+        per_key.append(
+            {
+                "key": label,
+                "keyid": keyid,
+                "store": transport.describe(),
+                "sessions_new": report.sessions_new,
+                "sessions_updated": report.sessions_updated,
+                "chunks": report.chunks,
+                "bytes": report.bytes,
+                "errors": report.errors,
+            }
+        )
+
+    payload = {"keys": per_key, **totals, "errors": all_errors}
+    lines = [f"keyring  {len(entries)} reader key(s)"]
+    for row in per_key:
+        if "error" in row and len(row) <= 3:
+            lines.append(f"  {row['key']:<16}ERROR {row['error']}")
+            continue
+        lines.append(
+            f"  {row['key']:<16}new {row.get('sessions_new', 0)}  "
+            f"updated {row.get('sessions_updated', 0)}  "
+            f"{_human(row.get('bytes', 0))}"
+        )
+    lines.append(f"pulled   {store.root / 'pulled'}")
+    lines += [f"ERROR    {problem}" for problem in all_errors]
+    if not all_errors and (totals["sessions_new"] or totals["sessions_updated"]):
+        lines.append("run `ezcl collect --include-pulled -i` to journal them")
+    _emit(payload, args.json, lines)
+    return 0 if not all_errors else 1
+
+
 def cmd_pull(args: argparse.Namespace) -> int:
     store = _store_for(args)
+    allow_legacy = bool(getattr(args, "allow_legacy", False))
+
+    # A populated keyring means this machine pulls as one or more reader keys,
+    # each against its own store; an empty (or absent) keyring falls back to the
+    # single device token this machine is configured with -- a dev's own pull,
+    # unchanged.
+    entries = _keyring_entries(_load_keyring(store))
+    if entries:
+        return _pull_keyring(args, store, entries, allow_legacy)
+
     config = load_config(store, os.getcwd())
     try:
         transport = transport_for(config)
@@ -1010,15 +1411,18 @@ def cmd_pull(args: argparse.Namespace) -> int:
         print(f"error: {error}", file=sys.stderr)
         return 2
 
-    since: str | None = None
-    if args.since:
-        try:
-            since = isoformat(since_to_datetime(args.since, datetime.now(timezone.utc)))
-        except ValueError as error:
-            print(f"error: {error}", file=sys.stderr)
-            return 2
+    since = _resolve_since(args)
+    if since is False:
+        return 2
 
-    report = pull_sessions(PullView(transport), store, since=since, authors=args.author)
+    report = _call_pull(
+        PullView(transport),
+        store,
+        since=since,  # type: ignore[arg-type]
+        authors=args.author,
+        keyid=None,
+        allow_legacy=allow_legacy,
+    )
     payload = {
         "store": transport.describe(),
         "sessions_new": report.sessions_new,
@@ -1039,6 +1443,124 @@ def cmd_pull(args: argparse.Namespace) -> int:
         lines.append("run `ezcl collect --include-pulled -i` to journal them")
     _emit(payload, args.json, lines)
     return 0 if report.ok else 1
+
+
+def cmd_keyring(args: argparse.Namespace) -> int:
+    """Manage the reader (``ezr_``) keys this machine pulls with.
+
+    All storage/probe logic lives in :mod:`ezchangelog.keyring`; this command
+    is the argparse surface over it. Loaded lazily so a build without that
+    module still runs every other command.
+    """
+    store = _store_for(args)
+    module = _keyring_module()
+    if module is None:
+        print(
+            "error: reader keyring support is not available in this build "
+            "(ezchangelog/keyring.py is missing)",
+            file=sys.stderr,
+        )
+        return 2
+
+    loader = getattr(module, "load_keyring", None)
+    if not callable(loader):
+        print("error: ezchangelog.keyring has no load_keyring()", file=sys.stderr)
+        return 2
+    try:
+        keyring = loader(store)
+    except Exception as error:  # a corrupt keyring must not crash the CLI
+        print(f"error: could not load the keyring: {error}", file=sys.stderr)
+        return 2
+
+    try:
+        if args.keyring_command == "add":
+            # Refuse anything but a reader key before the module probes it, so
+            # the error names the real problem rather than a downstream 401.
+            try:
+                key_set = parse_key(args.token)
+            except CryptoError as error:
+                print(f"error: {error}", file=sys.stderr)
+                return 2
+            if key_set.kind != "reader":
+                print(
+                    "error: the keyring holds reader keys only; this is a "
+                    f"{key_set.kind} key. A developer's own device key is "
+                    "configured as the store token, not added here.",
+                    file=sys.stderr,
+                )
+                return 2
+            config = load_config(store, os.getcwd())
+            # Keyring.add takes store=, not store_url= (the two build agents
+            # diverged on the kwarg — review finding 1); and it does not
+            # persist, so the caller saves.
+            entry = keyring.add(
+                args.token, label=args.label, store=config.store_url
+            )
+            keyring.save()
+            keyid = _entry_field(entry, "keyid") or key_set.keyid
+            label = _entry_field(entry, "label") or (args.label or "")
+            _emit(
+                {"added": {"keyid": keyid, "label": label}},
+                args.json,
+                [
+                    f"added reader key {keyid[:8]}"
+                    + (f" ({label})" if label else ""),
+                    "the token is stored keyring-private and never printed back.",
+                ],
+            )
+            return 0
+
+        if args.keyring_command == "list":
+            entries = _keyring_entries(keyring)
+            rows = [
+                {
+                    "keyid": _entry_field(e, "keyid"),
+                    "label": _entry_field(e, "label"),
+                    "store": _entry_field(e, "store"),
+                    "reader_id": _entry_field(e, "reader_id"),
+                    "added_at": _entry_field(e, "added_at"),
+                }
+                for e in entries
+            ]
+            lines = [f"{len(rows)} reader key(s) in the keyring"]
+            for row in rows:
+                lines.append(
+                    f"  {row['keyid'][:8]:<10}{_shorten(row['label'] or '-', 16)}"
+                    f"{_shorten(row['store'] or '-', 34)}"
+                    f"{_fmt_ts(row['added_at'])}"
+                )
+            # No code path prints a token (same discipline as Config.describe).
+            _emit({"keys": rows}, args.json, lines)
+            return 0
+
+        # remove -- by label or keyid.
+        removed = keyring.remove(args.selector)
+        if removed:
+            keyring.save()
+        ok = bool(removed)
+        _emit(
+            {"removed": ok, "selector": args.selector},
+            args.json,
+            [
+                f"removed {args.selector} from the keyring"
+                if ok
+                else f"no keyring entry matched {args.selector!r}",
+                "pulled/ transcripts already fetched stay on disk; to stop a "
+                "developer sharing, they must run `ezup token revoke`.",
+            ],
+        )
+        return 0 if ok else 1
+    except CryptoError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    except TransportError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    except AttributeError as error:
+        # The keyring module is present but missing a method this command
+        # expects: report precisely instead of a raw traceback.
+        print(f"error: keyring operation unsupported: {error}", file=sys.stderr)
+        return 2
 
 
 # -- statusline ---------------------------------------------------------------
@@ -1287,6 +1809,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         help="only this author; repeat for several",
     )
+    pull_parser.add_argument(
+        "--allow-legacy",
+        action="store_true",
+        help="also pull legacy plaintext sessions (no encryption, no wrapped "
+        "key); off by default because such bytes are unverified -- the store "
+        "operator could have substituted them",
+    )
     pull_parser.add_argument("--json", action="store_true")
     pull_parser.set_defaults(func=cmd_pull)
 
@@ -1330,6 +1859,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     revoke.add_argument("--json", action="store_true")
     revoke.set_defaults(func=cmd_token, token_command="revoke")
+
+    keyring_parser = subparsers.add_parser(
+        "keyring",
+        help="manage the reader (ezr_) keys this machine pulls with",
+    )
+    keyring_sub = keyring_parser.add_subparsers(dest="keyring_command", required=True)
+    kr_add = keyring_sub.add_parser(
+        "add", help="add a reader key (ezr_...) a developer shared with you"
+    )
+    kr_add.add_argument("token", help="the pasted ezr_ reader key")
+    kr_add.add_argument(
+        "--label", help="a name for this key (default: the sessions' author)"
+    )
+    kr_add.add_argument("--json", action="store_true")
+    kr_add.set_defaults(func=cmd_keyring, keyring_command="add")
+    kr_list = keyring_sub.add_parser(
+        "list", help="list the reader keys in the keyring (never prints tokens)"
+    )
+    kr_list.add_argument("--json", action="store_true")
+    kr_list.set_defaults(func=cmd_keyring, keyring_command="list")
+    kr_remove = keyring_sub.add_parser(
+        "remove", help="drop a reader key from the keyring, by label or keyid"
+    )
+    kr_remove.add_argument("selector", help="the key's label or keyid")
+    kr_remove.add_argument("--json", action="store_true")
+    kr_remove.set_defaults(func=cmd_keyring, keyring_command="remove")
 
     return parser
 

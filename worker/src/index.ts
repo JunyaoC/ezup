@@ -21,6 +21,23 @@
  * `scoped_device_id` names the minting device, so an operator can pull that
  * one machine's sessions and nothing else. Scoped readers are strictly
  * read-only -- they cannot write, delete, or mint further tokens.
+ *
+ * End-to-end encryption (docs/E2E-CONTRACT.md) changes what the bytes are, not
+ * what this worker does with them, and it adds NO crypto dependency here:
+ * - Auth: the client sends a *derived* bearer (`ezw_` + HKDF of the pasted
+ *   `ezu_`/`ezr_` key). authenticate() is mechanically unchanged -- it hashes
+ *   whatever bearer string arrives and looks the digest up -- but the digest
+ *   is now registered by the client at mint time (`token_sha256` in the mint
+ *   request), so no secret of any kind is ever generated or returned by this
+ *   worker.
+ * - Chunks: a session with enc = 'aead-v1' stores AES-256-GCM ciphertext
+ *   bodies of exactly `length + 16` bytes for a `length`-byte plaintext range;
+ *   offsets and lengths stay plaintext addressing, and the declared sha256 is
+ *   of the ciphertext, so hashing/dedupe/409 logic is untouched.
+ * - Keys: per-session data keys are stored only as wrapped_keys rows, opaque
+ *   60-byte blobs sealed to a recipient's key-encryption key. The worker can
+ *   check shapes and ownership but can never decrypt a chunk or a wrap, even
+ *   if fully malicious -- it holds only bearer hashes and ciphertext.
  */
 
 import { VIEWER_HTML } from "./viewer";
@@ -41,6 +58,25 @@ const MAX_JSON = 64 * 1024;
 const SESSION_PAGE = 1000;
 /** R2 accepts at most 1000 keys per bulk delete. */
 const DELETE_BATCH = 1000;
+
+/** AES-GCM appends a 16-byte tag: an encrypted chunk body is length + GCM_TAG
+ *  bytes on the wire and in R2, while `length` stays the plaintext range. */
+const GCM_TAG = 16;
+/** sessions.enc value under the current E2E contract. A new byte contract gets
+ *  a new name ('aead-v2'), never a schema change. */
+const ENC_SCHEME = "aead-v1";
+/** A wrapped data key is always 12 nonce + 32 ct + 16 tag = 60 bytes. The
+ *  length is the only property of a wrap this worker can verify. */
+const WRAP_BYTES = 60;
+/** Max entries per POST /v1/wrapped_keys; a new-reader history backfill over
+ *  more sessions than this arrives as several requests. */
+const WRAP_BATCH = 500;
+/** 500 wraps at ~220 JSON bytes each overflow MAX_JSON, so the wraps route
+ *  carries its own body cap. */
+const MAX_WRAPS_JSON = 256 * 1024;
+/** D1 allows at most 100 bound parameters per statement, so IN lists and
+ *  multi-row upserts are chunked to stay under it. */
+const D1_PARAM_LIMIT = 100;
 
 /** Admin-token guessing budget: this many failures from one IP inside the
  *  window locks that IP out for the lockout. One correct guess is a token with
@@ -63,7 +99,6 @@ const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
  *  it and still publishes only its own. Roles never grant write access to
  *  another device's session -- that is ownership, and ownership is not a role. */
 type Role = "device" | "reader";
-const ROLES: readonly string[] = ["device", "reader"];
 
 // --- small helpers --------------------------------------------------------
 
@@ -157,8 +192,11 @@ async function readBodyText(request: Request, limit: number): Promise<string | n
   return new TextDecoder().decode(joined);
 }
 
-async function readJson(request: Request): Promise<Record<string, unknown> | null> {
-  const text = await readBodyText(request, MAX_JSON);
+async function readJson(
+  request: Request,
+  limit = MAX_JSON,
+): Promise<Record<string, unknown> | null> {
+  const text = await readBodyText(request, limit);
   if (text === null) return null;
   let parsed: unknown;
   try {
@@ -174,6 +212,18 @@ async function readJson(request: Request): Promise<Record<string, unknown> | nul
 function str(source: Record<string, unknown>, key: string): string | null {
   const value = source[key];
   return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/** Decoded byte length of standard padded base64, or -1 when malformed. The
+ *  bytes themselves are opaque ciphertext this worker can neither read nor
+ *  verify, so their length is the whole shape check. */
+function base64Length(text: string): number {
+  if (text.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(text)) return -1;
+  try {
+    return atob(text).length;
+  } catch {
+    return -1;
+  }
 }
 
 // --- auth -----------------------------------------------------------------
@@ -343,29 +393,50 @@ async function createDevice(request: Request, env: Env): Promise<Response> {
   const name = str(body, "name");
   const email = str(body, "email");
   if (!name || !email) return fail(400, "name and email are required");
+  // E2E flip: only devices are minted here. The old admin-minted global reader
+  // (scope NULL, reads the whole team) is gone -- a reader must be scoped to
+  // the device that mints it (POST /v1/token), or a single leaked key would
+  // read everyone. Pre-flip global-reader rows keep authenticating until the
+  // re-mint revokes them; no new ones can exist.
   const role = str(body, "role") ?? "device";
-  if (!ROLES.includes(role)) return fail(400, "role must be 'device' or 'reader'");
+  if (role !== "device") {
+    return fail(400, "role must be 'device'; readers are minted by devices via POST /v1/token");
+  }
+  // The client generated the secret and sends only sha256 of the derived
+  // `ezw_` bearer. Registering a hash means a fully-compromised worker (or a
+  // log line, or this response) can never yield a usable credential, let alone
+  // the encryption key that HKDF-siblings it.
+  const tokenSha = str(body, "token_sha256");
+  if (!tokenSha || !HEX64.test(tokenSha)) {
+    return fail(400, "token_sha256 must be 64 lowercase hex chars");
+  }
 
-  const secret = hex(crypto.getRandomValues(new Uint8Array(32)).buffer);
-  const token = `ezu_${secret}`;
   const id = crypto.randomUUID();
-  // RETURNING makes the mint atomic with the write: the plaintext is only
-  // handed out once a row provably exists. A D1 failure throws instead, and the
-  // handler turns it into a sanitized 500 -- never a token with no row.
-  const created = await env.DB.prepare(
-    `INSERT INTO devices (id, name, email, role, token_sha256, created_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-     RETURNING id`,
-  )
-    .bind(id, name, email, role, await sha256Hex(token), nowIso())
-    .first<{ id: string }>();
+  let created: { id: string } | null = null;
+  try {
+    created = await env.DB.prepare(
+      `INSERT INTO devices (id, name, email, role, token_sha256, created_at)
+       VALUES (?1, ?2, ?3, 'device', ?4, ?5)
+       RETURNING id`,
+    )
+      .bind(id, name, email, tokenSha, nowIso())
+      .first<{ id: string }>();
+  } catch (error) {
+    // token_sha256 is UNIQUE: the same pasted key registered twice is a client
+    // mistake worth naming, not a 500.
+    if (String((error as Error)?.message ?? "").includes("UNIQUE")) {
+      return fail(409, "token_sha256 is already registered");
+    }
+    throw error;
+  }
   if (!created) return fail(500, "device was not created");
 
   // A correct admin token clears the guessing counter for that IP.
   await env.DB.prepare("DELETE FROM admin_failures WHERE ip = ?1").bind(ip).run();
 
-  // The only moment the plaintext exists outside the client.
-  return json({ token, id: created.id, role }, 201);
+  // No token in the response, ever again: the server never saw one. The id is
+  // what the client records as device_id (it is the recipient of self-wraps).
+  return json({ id: created.id, role: "device" }, 201);
 }
 
 // --- /v1/token — dev-minted readers ---------------------------------------
@@ -380,24 +451,36 @@ async function mintReader(request: Request, env: Env, device: Device): Promise<R
   if (!body) return fail(400, "expected a JSON object body");
   const name = str(body, "name");
   if (!name) return fail(400, "name is required — say who this token is for");
+  // Same E2E flip as createDevice: the minting device generated the reader's
+  // `ezr_` secret locally and registers only the derived bearer's hash. This
+  // worker never holds anything that can authenticate or decrypt.
+  const tokenSha = str(body, "token_sha256");
+  if (!tokenSha || !HEX64.test(tokenSha)) {
+    return fail(400, "token_sha256 must be 64 lowercase hex chars");
+  }
 
-  const secret = hex(crypto.getRandomValues(new Uint8Array(32)).buffer);
-  const token = `ezr_${secret}`;
   const id = crypto.randomUUID();
-  // Same atomic mint-with-RETURNING discipline as createDevice: the plaintext
-  // leaves this function only if the row provably exists.
-  const created = await env.DB.prepare(
-    `INSERT INTO devices (id, name, email, role, scoped_device_id, token_sha256, created_at)
-     VALUES (?1, ?2, ?3, 'reader', ?4, ?5, ?6)
-     RETURNING id`,
-  )
-    .bind(id, name, device.email, device.id, await sha256Hex(token), nowIso())
-    .first<{ id: string }>();
+  let created: { id: string } | null = null;
+  try {
+    created = await env.DB.prepare(
+      `INSERT INTO devices (id, name, email, role, scoped_device_id, token_sha256, created_at)
+       VALUES (?1, ?2, ?3, 'reader', ?4, ?5, ?6)
+       RETURNING id`,
+    )
+      .bind(id, name, device.email, device.id, tokenSha, nowIso())
+      .first<{ id: string }>();
+  } catch (error) {
+    if (String((error as Error)?.message ?? "").includes("UNIQUE")) {
+      return fail(409, "token_sha256 is already registered");
+    }
+    throw error;
+  }
   if (!created) return fail(500, "token was not created");
 
+  // The id is what the device wraps data keys to (wrapped_keys.recipient_id)
+  // and what the reader's tooling learns back from GET /v1/wrapped_keys.
   return json(
     {
-      token,
       id: created.id,
       grants: `read-only access to sessions published by device ${device.name}`,
     },
@@ -449,6 +532,29 @@ async function putSession(request: Request, env: Env, device: Device): Promise<R
   const level = str(body, "level") ?? "raw";
   if (level !== "raw") return fail(400, "only level=raw is supported");
 
+  // E2E markers. Omitted means "leave the stored values alone" so legacy
+  // clients keep working. When present: enc may only ever be 'aead-v1' (an
+  // explicit null, or any other string, is a downgrade attempt -- a lying
+  // server is caught by the client-side pin anyway, but an honest one
+  // refuses), and enc_gen may only stay equal or grow, which is what keeps
+  // (enc_gen, offset) nonces from ever repeating with different plaintext.
+  let enc: string | null = null;
+  if (body["enc"] !== undefined) {
+    if (body["enc"] !== ENC_SCHEME) return fail(400, "cannot downgrade an encrypted session");
+    enc = ENC_SCHEME;
+  }
+  let encGen: number | null = null;
+  if (body["enc_gen"] !== undefined) {
+    const value = body["enc_gen"];
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > 0xffffffff) {
+      return fail(400, "enc_gen must be a uint32");
+    }
+    encGen = value;
+  }
+  if (enc !== null && (encGen === null || encGen < 1)) {
+    return fail(400, "enc requires enc_gen >= 1");
+  }
+
   const updated = nowIso();
   const updatedMs = Date.now();
   // Re-registering is how a client refreshes the title or last_ts as a session
@@ -458,14 +564,16 @@ async function putSession(request: Request, env: Env, device: Device): Promise<R
   //
   // The WHERE on the conflict branch is the ownership check, and it is part of
   // the same statement rather than a lookup before it: a check-then-write pair
-  // can be raced, a guarded upsert cannot. No rows back means either another
-  // device owns the id or nobody does, and only then is a second query needed
-  // to say which.
+  // can be raced, a guarded upsert cannot. The enc_gen monotonicity guard
+  // rides in the same WHERE for the same reason: two of the owner's own
+  // requests racing must not let a stale generation land after a newer one.
+  // No rows back means another device owns the id, nobody does, or the guard
+  // refused -- only then is a second query needed to say which.
   const written = await env.DB.prepare(
     `INSERT INTO sessions
        (session, device_id, author, project, branch, cwd, title,
-        first_ts, last_ts, size, updated_at, updated_ms, deleted_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, NULL)
+        first_ts, last_ts, size, updated_at, updated_ms, deleted_at, enc, enc_gen)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, NULL, ?12, COALESCE(?13, 0))
      ON CONFLICT(session) DO UPDATE SET
        author     = excluded.author,
        project    = excluded.project,
@@ -476,8 +584,10 @@ async function putSession(request: Request, env: Env, device: Device): Promise<R
        last_ts    = COALESCE(MAX(sessions.last_ts, excluded.last_ts), excluded.last_ts, sessions.last_ts),
        updated_at = excluded.updated_at,
        updated_ms = excluded.updated_ms,
-       deleted_at = NULL
-     WHERE sessions.device_id = ?2
+       deleted_at = NULL,
+       enc        = COALESCE(excluded.enc, sessions.enc),
+       enc_gen    = COALESCE(?13, sessions.enc_gen)
+     WHERE sessions.device_id = ?2 AND (?13 IS NULL OR ?13 >= sessions.enc_gen)
      RETURNING session`,
   )
     .bind(
@@ -492,16 +602,27 @@ async function putSession(request: Request, env: Env, device: Device): Promise<R
       str(body, "last_ts"),
       updated,
       updatedMs,
+      enc,
+      encGen,
     )
     .first<{ session: string }>();
 
   if (!written) {
-    const owner = await env.DB.prepare("SELECT device_id, author FROM sessions WHERE session = ?1")
+    const owner = await env.DB.prepare(
+      "SELECT device_id, author, enc_gen FROM sessions WHERE session = ?1",
+    )
       .bind(session)
-      .first<SessionOwner>();
+      .first<SessionOwner & { enc_gen: number }>();
     // The row vanished between the upsert and this lookup; the caller can retry.
     if (!owner) return fail(409, "session changed concurrently, retry");
-    return writeDenied(device, owner) ?? fail(409, "session changed concurrently, retry");
+    const denied = writeDenied(device, owner);
+    if (denied) return denied;
+    // The owner was allowed, so the enc_gen guard is what refused: a lowered
+    // generation would re-use nonces the old one already burned.
+    if (encGen !== null && encGen < (owner.enc_gen ?? 0)) {
+      return fail(400, "cannot downgrade an encrypted session");
+    }
+    return fail(409, "session changed concurrently, retry");
   }
 
   return json({ ok: true });
@@ -577,21 +698,30 @@ async function putChunk(request: Request, env: Env, url: URL, device: Device): P
   if (!expected || !HEX64.test(expected)) return fail(400, "invalid sha256");
   if (length > MAX_CHUNK) return fail(413, `chunk exceeds ${MAX_CHUNK} bytes`);
 
-  const declared = request.headers.get("content-length");
-  if (declared !== null) {
-    const size = Number(declared);
-    if (size > MAX_CHUNK) return fail(413, `chunk exceeds ${MAX_CHUNK} bytes`);
-    if (size !== length) return fail(400, "content-length does not match length");
-  }
-
   const row = await env.DB.prepare(
-    "SELECT author, device_id FROM sessions WHERE session = ?1 AND deleted_at IS NULL",
+    "SELECT author, device_id, enc FROM sessions WHERE session = ?1 AND deleted_at IS NULL",
   )
     .bind(session)
-    .first<SessionOwner>();
+    .first<SessionOwner & { enc: string | null }>();
   if (!row) return fail(404, "unknown session: register it with POST /v1/session first");
   const denied = writeDenied(device, row);
   if (denied) return denied;
+
+  // For an encrypted session the body is ciphertext: exactly the plaintext
+  // range plus the GCM tag. `length` stays plaintext addressing (the R2 key is
+  // an address, not a size claim), so every body-size decision below -- the
+  // content-length check, the streaming cap, FixedLengthStream -- uses bodyLen
+  // while the `length` param itself stays capped at MAX_CHUNK above. sha256 is
+  // verified over received bytes as always; for 'aead-v1' those bytes are
+  // ciphertext and so is the declared digest.
+  const bodyLen = row.enc === ENC_SCHEME ? length + GCM_TAG : length;
+
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const size = Number(declared);
+    if (size > bodyLen) return fail(413, `chunk exceeds ${bodyLen} bytes`);
+    if (size !== bodyLen) return fail(400, "content-length does not match length");
+  }
 
   // Fast path only. The same range with the same content is already durable, so
   // say so without touching R2. The authoritative decision is the upsert below;
@@ -611,20 +741,20 @@ async function putChunk(request: Request, env: Env, url: URL, device: Device): P
   if (!request.body) return fail(400, "missing body");
 
   const key = chunkKey(row.author, session, offset, length);
-  const hashed = hashingPassThrough(request.body, length);
+  const hashed = hashingPassThrough(request.body, bodyLen);
   try {
     // R2 refuses a stream of unknown length, and piping through the digest
     // transform erased the one the request carried. The declared length is
     // re-imposed here; FixedLengthStream also makes a short body an error
     // instead of a silently truncated object.
-    const sized = hashed.stream.pipeThrough(new FixedLengthStream(length));
+    const sized = hashed.stream.pipeThrough(new FixedLengthStream(bodyLen));
     await env.BUCKET.put(key, sized);
   } catch (error) {
     // A put that threw should have left nothing behind, but a partial object
     // here would be one no chunks row can ever point at. Sweep it either way.
     await forget(env, key);
     if (hashed.exceeded()) return fail(413, "body exceeded the declared length");
-    if (hashed.size() < length) {
+    if (hashed.size() < bodyLen) {
       // The client's fault, not storage's: retrying the same short body can
       // never succeed, so it must not look like a 5xx.
       return fail(400, "body shorter than the declared length");
@@ -637,7 +767,7 @@ async function putChunk(request: Request, env: Env, url: URL, device: Device): P
   }
 
   const actual = hex(await hashed.digest);
-  if (hashed.size() !== length || !constantTimeEqual(actual, expected)) {
+  if (hashed.size() !== bodyLen || !constantTimeEqual(actual, expected)) {
     // The object exists but no chunks row points at it, so it is unreachable by
     // any reader; delete it anyway so a failed publish costs nothing.
     await forget(env, key);
@@ -693,6 +823,199 @@ async function putChunk(request: Request, env: Env, url: URL, device: Device): P
   return json({ ok: true, key: claimed.key });
 }
 
+// --- /v1/wrapped_keys -----------------------------------------------------
+
+interface WrapEntry {
+  session: string;
+  recipient_id: string;
+  enc_gen: number;
+  wrap: string;
+}
+
+/** Runs `SELECT ... WHERE <column> IN (ids)` in slices that respect D1's
+ *  bound-parameter cap, with `extra` params bound before the id list. */
+async function selectIn<T>(
+  env: Env,
+  sql: (placeholders: string) => string,
+  extra: unknown[],
+  ids: string[],
+): Promise<T[]> {
+  const out: T[] = [];
+  const room = D1_PARAM_LIMIT - extra.length;
+  for (let at = 0; at < ids.length; at += room) {
+    const slice = ids.slice(at, at + room);
+    const placeholders = slice.map((_, i) => `?${extra.length + i + 1}`).join(", ");
+    const rows = await env.DB.prepare(sql(placeholders))
+      .bind(...extra, ...slice)
+      .all<T>();
+    out.push(...(rows.results ?? []) as T[]);
+  }
+  return out;
+}
+
+/** A device stores wrapped data keys: one row per (session, recipient), where
+ *  the recipient is itself (the self-wrap that makes DK recovery possible from
+ *  the pasted key alone) or a reader it minted. Everything is validated before
+ *  anything is written -- a 400 names the first bad index and writes nothing --
+ *  because the caller treats the batch as one operation (a new-reader history
+ *  backfill) and a half-applied batch would leave sessions it believes are
+ *  granted but are not. */
+async function putWrappedKeys(request: Request, env: Env, device: Device): Promise<Response> {
+  // Device role only: readers receive wraps, they never grant them. This also
+  // keeps a legacy global reader (scope NULL) from writing key material.
+  if (device.role !== "device") return fail(403, "only a device token can store wrapped keys");
+
+  const body = await readJson(request, MAX_WRAPS_JSON);
+  if (!body) return fail(400, "expected a JSON object body");
+  const raw = body["wraps"];
+  if (!Array.isArray(raw) || raw.length === 0) return fail(400, "wraps must be a non-empty array");
+  if (raw.length > WRAP_BATCH) return fail(400, `at most ${WRAP_BATCH} wraps per request`);
+
+  const entries: WrapEntry[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const item = raw[i];
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return fail(400, `wraps[${i}]: expected an object`);
+    }
+    const entry = item as Record<string, unknown>;
+    const session = str(entry, "session");
+    if (!session || !SAFE_ID.test(session)) return fail(400, `wraps[${i}]: invalid session id`);
+    const recipient = str(entry, "recipient_id");
+    if (!recipient) return fail(400, `wraps[${i}]: recipient_id is required`);
+    const encGen = entry["enc_gen"];
+    if (typeof encGen !== "number" || !Number.isInteger(encGen) || encGen < 1) {
+      return fail(400, `wraps[${i}]: enc_gen must be an integer >= 1`);
+    }
+    const wrap = str(entry, "wrap");
+    if (!wrap || base64Length(wrap) !== WRAP_BYTES) {
+      return fail(400, `wraps[${i}]: wrap must be base64 of exactly ${WRAP_BYTES} bytes`);
+    }
+    entries.push({ session, recipient_id: recipient, enc_gen: encGen, wrap });
+  }
+
+  // Ownership: every named session must be a live row owned by the caller --
+  // the same rule that gates chunks. Checked in bulk over the distinct ids.
+  const sessionIds = [...new Set(entries.map((e) => e.session))];
+  const owned = await selectIn<{ session: string; device_id: string | null }>(
+    env,
+    (ph) => `SELECT session, device_id FROM sessions
+              WHERE deleted_at IS NULL AND session IN (${ph})`,
+    [],
+    sessionIds,
+  );
+  const ownerOf = new Map(owned.map((r) => [r.session, r.device_id]));
+
+  // Recipients: the caller itself, or an *active* reader the caller minted.
+  // A revoked reader's existing rows stay (its auth is already dead) but it
+  // can never receive a new grant -- that is the point of checking here.
+  const recipientIds = [...new Set(entries.map((e) => e.recipient_id))].filter(
+    (id) => id !== device.id,
+  );
+  const readers = await selectIn<{ id: string }>(
+    env,
+    (ph) => `SELECT id FROM devices
+              WHERE role = 'reader' AND scoped_device_id = ?1 AND revoked_at IS NULL
+                AND id IN (${ph})`,
+    [device.id],
+    recipientIds,
+  );
+  const allowed = new Set([device.id, ...readers.map((r) => r.id)]);
+
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    const owner = ownerOf.get(entry.session);
+    if (owner === undefined) return fail(400, `wraps[${i}]: unknown session`);
+    if (owner !== device.id) return fail(400, `wraps[${i}]: session not owned by this device`);
+    if (!allowed.has(entry.recipient_id)) {
+      return fail(400, `wraps[${i}]: recipient is not this device or an active reader it minted`);
+    }
+  }
+
+  // Upsert everything in one D1 batch (atomic). The owning device is
+  // authoritative for its own grants, so the overwrite is unconditional:
+  // rotation replaces the old generation's wrap and there is nothing to merge.
+  const now = nowIso();
+  const rowsPerStatement = Math.floor(D1_PARAM_LIMIT / 5);
+  const statements = [];
+  for (let at = 0; at < entries.length; at += rowsPerStatement) {
+    const slice = entries.slice(at, at + rowsPerStatement);
+    const values = slice
+      .map((_, i) => `(?${i * 5 + 1}, ?${i * 5 + 2}, ?${i * 5 + 3}, ?${i * 5 + 4}, ?${i * 5 + 5})`)
+      .join(", ");
+    statements.push(
+      env.DB.prepare(
+        `INSERT INTO wrapped_keys (session, recipient_id, enc_gen, wrap, created_at)
+         VALUES ${values}
+         ON CONFLICT(session, recipient_id) DO UPDATE SET
+           enc_gen    = excluded.enc_gen,
+           wrap       = excluded.wrap,
+           created_at = excluded.created_at
+         WHERE excluded.enc_gen >= wrapped_keys.enc_gen`,
+      ).bind(...slice.flatMap((e) => [e.session, e.recipient_id, e.enc_gen, e.wrap, now])),
+    );
+  }
+  await env.DB.batch(statements);
+
+  return json({ ok: true, written: entries.length });
+}
+
+/** Returns the wraps addressed to the authenticated caller -- and only those.
+ *  recipient_id is never a parameter: possession of the bearer is possession
+ *  of the wrap, so asking for someone else's rows is not expressible. The
+ *  caller's own device id rides along as `recipient_id` because it is the
+ *  unwrap AAD's recipient component and a freshly-onboarded reader has no
+ *  other way to learn it (contract Q2 resolution: self-information, leaks
+ *  nothing). */
+async function getWrappedKeys(env: Env, url: URL, device: Device): Promise<Response> {
+  const session = url.searchParams.get("session");
+
+  if (session !== null) {
+    if (!SAFE_ID.test(session)) return fail(400, "invalid session id");
+    const live = await env.DB.prepare(
+      "SELECT device_id, author FROM sessions WHERE session = ?1 AND deleted_at IS NULL",
+    )
+      .bind(session)
+      .first<SessionOwner>();
+    // Same opacity rule as /v1/chunks: unreadable is indistinguishable from
+    // nonexistent. A readable session with no wrap for this caller is an
+    // empty list, not a 404 -- "you may read it but cannot decrypt it" is a
+    // real state (e.g. a wrap not yet granted).
+    if (!live || !canRead(device, live)) return fail(404, "unknown session");
+    const rows = await env.DB.prepare(
+      "SELECT session, enc_gen, wrap FROM wrapped_keys WHERE session = ?1 AND recipient_id = ?2",
+    )
+      .bind(session, device.id)
+      .all();
+    return json({ recipient_id: device.id, wraps: rows.results ?? [] });
+  }
+
+  // Bulk form: every wrap addressed to the caller across sessions it may
+  // read. This is the recovery path (a device holding only its pasted key
+  // rebuilds every DK from its self-wraps) and the new-reader backfill source.
+  // Unpaginated by contract (Q4): bounded by the caller's own session count.
+  const scope = readScope(device);
+  const rows =
+    scope === null
+      ? await env.DB.prepare(
+          `SELECT w.session AS session, w.enc_gen AS enc_gen, w.wrap AS wrap
+             FROM wrapped_keys w JOIN sessions s ON s.session = w.session
+            WHERE w.recipient_id = ?1 AND s.deleted_at IS NULL
+            ORDER BY w.session ASC`,
+        )
+          .bind(device.id)
+          .all()
+      : await env.DB.prepare(
+          `SELECT w.session AS session, w.enc_gen AS enc_gen, w.wrap AS wrap
+             FROM wrapped_keys w JOIN sessions s ON s.session = w.session
+            WHERE w.recipient_id = ?1 AND s.deleted_at IS NULL AND s.device_id = ?2
+            ORDER BY w.session ASC`,
+        )
+          .bind(device.id, scope)
+          .all();
+
+  return json({ recipient_id: device.id, wraps: rows.results ?? [] });
+}
+
 // --- DELETE /v1/session ---------------------------------------------------
 
 async function deleteSession(env: Env, url: URL, device: Device): Promise<Response> {
@@ -724,6 +1047,9 @@ async function deleteSession(env: Env, url: URL, device: Device): Promise<Respon
   // by another owner cannot be tombstoned by this request.
   await env.DB.batch([
     env.DB.prepare("DELETE FROM chunks WHERE session = ?1").bind(session),
+    // Wraps cascade with the session: a deleted session's DK has nothing left
+    // to decrypt, and a later re-register re-wraps under a fresh DK anyway.
+    env.DB.prepare("DELETE FROM wrapped_keys WHERE session = ?1").bind(session),
     env.DB.prepare(
       `UPDATE sessions SET deleted_at = ?2, updated_at = ?2, updated_ms = ?3, size = 0
         WHERE session = ?1 AND device_id = ?4`,
@@ -754,7 +1080,7 @@ async function listSessions(env: Env, url: URL, device: Device): Promise<Respons
   // caller already has costs one empty chunk manifest, while skipping one loses
   // it forever.
   const columns = `session, author, project, branch, cwd, title,
-                   first_ts, last_ts, size, updated_at`;
+                   first_ts, last_ts, size, updated_at, enc, enc_gen`;
   const order = "ORDER BY updated_ms ASC, session ASC LIMIT ?2";
   const listed =
     device.role === "reader"
@@ -781,10 +1107,10 @@ async function listChunks(env: Env, url: URL, device: Device): Promise<Response>
   if (!session || !SAFE_ID.test(session)) return fail(400, "invalid session id");
 
   const live = await env.DB.prepare(
-    "SELECT device_id, author FROM sessions WHERE session = ?1 AND deleted_at IS NULL",
+    "SELECT device_id, author, enc, enc_gen FROM sessions WHERE session = ?1 AND deleted_at IS NULL",
   )
     .bind(session)
-    .first<SessionOwner>();
+    .first<SessionOwner & { enc: string | null; enc_gen: number }>();
   // A session the caller may not read is reported as unknown rather than
   // forbidden: the id alone would otherwise confirm that a colleague is
   // sharing that session.
@@ -796,7 +1122,10 @@ async function listChunks(env: Env, url: URL, device: Device): Promise<Response>
     .bind(session)
     .all();
 
-  return json({ chunks: listed.results ?? [] });
+  // enc/enc_gen ride with the manifest so a puller can reconstruct nonces
+  // (BE4(enc_gen) || BE8(offset)) without a second request, and so a
+  // generation racing a rotation is detectable against the wrap's enc_gen.
+  return json({ chunks: listed.results ?? [], enc: live.enc ?? null, enc_gen: live.enc_gen ?? 0 });
 }
 
 // --- GET /v1/blob ---------------------------------------------------------
@@ -858,8 +1187,14 @@ export default {
         return new Response(VIEWER_HTML, {
           headers: {
             "content-type": "text/html; charset=utf-8",
+            // base-uri/form-action 'none' are the second layer under esc()
+            // (review finding 4): even if an unescaped interpolation ever slips
+            // in, an injected script cannot exfiltrate the keyring by planting a
+            // <base> or auto-submitting a form to another origin. connect-src is
+            // already same-origin only.
             "content-security-policy":
-              "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'",
+              "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " +
+              "connect-src 'self'; base-uri 'none'; form-action 'none'",
             "x-content-type-options": "nosniff",
             "referrer-policy": "no-referrer",
           },
@@ -899,6 +1234,13 @@ export default {
       if (path === "/v1/chunk") {
         if (method !== "POST") return fail(405, "method not allowed");
         return await putChunk(request, env, url, device);
+      }
+      if (path === "/v1/wrapped_keys") {
+        // POST gates itself to role 'device' inside; GET is any authenticated
+        // caller, always scoped to its own rows.
+        if (method === "POST") return await putWrappedKeys(request, env, device);
+        if (method === "GET") return await getWrappedKeys(env, url, device);
+        return fail(405, "method not allowed");
       }
       if (path === "/v1/sessions") {
         if (method !== "GET") return fail(405, "method not allowed");

@@ -8,9 +8,11 @@ version = "0.1.0"
 description = "Turn Claude Code session history into changelogs and reports"
 readme = "README.md"
 requires-python = ">=3.10"
-# Intentionally none: the pipeline shells out to the `claude` CLI rather than
-# depending on an SDK, and everything else is stdlib.
-dependencies = []
+# `cryptography` is the one permitted third-party dependency (E2E-CONTRACT
+# section 2): client-side AES-256-GCM and HKDF live in ezchangelog/crypto.py,
+# and only that module imports it. Everything else stays stdlib -- the
+# pipeline shells out to the `claude` CLI rather than depending on an SDK.
+dependencies = ["cryptography>=42"]
 
 [project.scripts]
 ezcl = "ezchangelog.cli:main"

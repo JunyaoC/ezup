@@ -14,6 +14,15 @@ is read only from the environment or from the private store -- a committed
 exfiltration payload. This module also has no code path that prints a token:
 :meth:`Config.describe` reports where one came from, never what it is.
 
+Under E2E the resolved ``token`` is the pasted ``ezu_``/``ezr_`` key -- the
+actual key material. It is handed to the transport, which derives the wire
+bearer and the encryption key from it (``ezchangelog.crypto``); the pasted
+string itself never goes on the wire and, per the rule above, is never read
+from a repo. ``device_id`` (this machine's ``devices.id`` UUID, printed by
+``ezup device mint``) is deliberately *not* a credential -- the server already
+knows it -- but it is identity, so it resolves from the environment and the
+machine-private store config only, never from a repo.
+
 Consent (``share``) is deliberately *not* resolved here; that lives in
 :mod:`ezchangelog.share`, which is the only module allowed to answer it.
 """
@@ -35,6 +44,7 @@ from .transport import ChunkRef, SessionInfo, Transport, TransportError, build_t
 STORE_ENV = "EZUPDATE_STORE"
 TOKEN_ENV = "EZUPDATE_TOKEN"
 AUTHOR_ENV = "EZUPDATE_AUTHOR"
+DEVICE_ID_ENV = "EZUPDATE_DEVICE_ID"
 
 # transport.build_transport falls back to this one on its own; accepting it here
 # too means a machine configured for either name keeps working.
@@ -66,6 +76,7 @@ class Config:
     store_url: str = ""
     token: str = ""
     author: str = ""
+    device_id: str = ""
     exclude: list[str] = field(default_factory=list)
     repo: str = ""
     origins: dict[str, str] = field(default_factory=dict)
@@ -89,6 +100,7 @@ class Config:
             "store": self.store_url,
             "token": self.token,
             "author": self.author,
+            "device_id": self.device_id,
         }
 
     def describe(self) -> list[str]:
@@ -211,6 +223,19 @@ def load_config(store: Store, cwd: str | Path | None = None) -> Config:
         author = default_author(cwd)
         origins["author"] = "git user.email"
 
+    # device_id resolves from the environment and the machine-private config
+    # only -- deliberately not via pick(), whose fallback chain ends at the
+    # repo. It is not a secret (the server knows it), but it is *identity*:
+    # the wrap recipient every published data key is addressed to. A committed
+    # config must not be able to redirect that.
+    device_id = os.environ.get(DEVICE_ID_ENV, "").strip()
+    if device_id:
+        origins["device_id"] = f"${DEVICE_ID_ENV}"
+    else:
+        device_id = str(machine.get("device_id") or "").strip()
+        if device_id:
+            origins["device_id"] = str(store_config_path(store))
+
     # `exclude` is a repo-level statement about the repo's own files, so it is
     # not something a machine-level config should be able to weaken.
     patterns = repo_config.get("exclude")
@@ -220,6 +245,7 @@ def load_config(store: Store, cwd: str | Path | None = None) -> Config:
         store_url=store_url,
         token=token,
         author=author,
+        device_id=device_id,
         exclude=exclude,
         repo=str(repo) if repo else "",
         origins=origins,
@@ -266,6 +292,26 @@ class PullView:
     def fetch_blob(self, key: str) -> bytes:
         return self.transport.get_blob(key)
 
+    # -- E2E surface, forwarded when the underlying transport has it ---------
+    # pull's decrypt path duck-types these off its backend; a LocalDirTransport
+    # (or an old fake) simply lacks them, which pull reads as "cannot decrypt".
+
+    @property
+    def key_set(self) -> Any:
+        return getattr(self.transport, "key_set", None)
+
+    @property
+    def recipient_id(self) -> str:
+        return str(getattr(self.transport, "device_id", "") or "")
+
+    def session_enc(self, session: str) -> tuple[str, int]:
+        probe = getattr(self.transport, "session_enc", None)
+        return probe(session) if probe is not None else ("", 0)
+
+    def get_wrapped_keys(self, session: str | None = None) -> list[dict[str, Any]]:
+        fetch = getattr(self.transport, "get_wrapped_keys", None)
+        return fetch(session) if fetch is not None else []
+
     def describe(self) -> str:
         return self.transport.describe()
 
@@ -274,6 +320,7 @@ __all__ = [
     "AUTHOR_ENV",
     "CREDENTIAL_KEYS",
     "Config",
+    "DEVICE_ID_ENV",
     "PullView",
     "STORE_ENV",
     "TOKEN_ENV",

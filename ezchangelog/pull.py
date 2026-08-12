@@ -28,13 +28,22 @@ field on the wire.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 
+from .crypto import (
+    ENC_SCHEME,
+    GCM_TAG,
+    CryptoError,
+    decrypt_chunk,
+    encrypt_chunk,
+    unwrap_dk,
+)
 from .store import Store, _write_json_atomic
 from .transport import parse_chunk_key
 from .window import isoformat, parse_timestamp
@@ -70,6 +79,14 @@ class PullReport:
     chunks: int = 0
     bytes: int = 0
     errors: list[str] = field(default_factory=list)
+    # Legacy plaintext sessions this caller holds no wrap for and did not pull
+    # (allow_legacy was off). Not errors: a deliberate default-safe skip, so
+    # the cursor is free to advance and the run still counts as ``ok``.
+    skipped: list[str] = field(default_factory=list)
+    # Legacy plaintext sessions pulled only because allow_legacy was on. Nothing
+    # cryptographic vouches for their bytes; the record carries the same flag so
+    # collect/journal can badge them "unverified plaintext".
+    unverified: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -111,16 +128,23 @@ def _safe_component(value: Any) -> str | None:
 # -- state -------------------------------------------------------------------
 
 
-def cursor_scope(authors: Iterable[str] | None) -> str:
+def cursor_scope(authors: Iterable[str] | None, keyid: str | None = None) -> str:
     """The key a cursor is stored under.
 
     One cursor per filter, because a cursor means "everything up to here has
     been pulled" and that is only true of the filter that produced it. A single
     global cursor advanced by ``pull --author alice`` would silently skip
     everyone else's sessions in that window, for good.
+
+    ``keyid`` extends the same rule to the PM keyring (contract 6.5): each
+    reader key sees a different slice of the store, so one key's cursor must
+    never be able to skip a window of another key's sessions. A keyring pull
+    scopes its cursor as ``key:<keyid>|<author scope>``; a single-key pull
+    (the developer's own) keeps the unprefixed legacy scope.
     """
     names = sorted({str(a) for a in authors or [] if str(a)})
-    return "authors:" + ",".join(names) if names else ALL_AUTHORS
+    scope = "authors:" + ",".join(names) if names else ALL_AUTHORS
+    return f"key:{keyid}|{scope}" if keyid else scope
 
 
 def read_cursor(state: dict[str, Any], scope: str) -> str | None:
@@ -278,12 +302,26 @@ def _prefix_for(chunks: list[_Chunk], base: int, end: int) -> list[_Chunk] | Non
     return prefix if cursor == end else None
 
 
-def _verify_local(path: Path, base: int, prefix: list[_Chunk]) -> bool:
+# Re-seals a local plaintext range so it can be compared against the store's
+# ciphertext sha256: (offset, plaintext) -> wire body. None for plaintext
+# sessions, where the local bytes hash directly.
+_Sealer = Callable[[int, bytes], bytes]
+
+
+def _verify_local(
+    path: Path, base: int, prefix: list[_Chunk], sealer: _Sealer | None = None
+) -> bool:
     """Do the bytes on disk really hash to what these ranges claim?
 
     The expensive answer, used only when there is no recorded generation to
     compare against -- a first pull after an upgrade, or a lost pull state. It
     is the same question the generation answers cheaply on every later run.
+
+    For an encrypted session the store's sha256s are ciphertext hashes while
+    the local file is plaintext, so ``sealer`` re-encrypts each range
+    deterministically (same DK, same (gen, offset) nonce => identical bytes)
+    before hashing. Any failure degrades to "stale -> refetch": safe, merely
+    costs bandwidth.
     """
     try:
         with path.open("rb") as handle:
@@ -292,6 +330,11 @@ def _verify_local(path: Path, base: int, prefix: list[_Chunk]) -> bool:
                 body = handle.read(chunk.length)
                 if len(body) != chunk.length:
                     return False
+                if sealer is not None:
+                    try:
+                        body = sealer(chunk.offset, body)
+                    except CryptoError:
+                        return False
                 if hashlib.sha256(body).hexdigest() != chunk.sha256:
                     return False
     except OSError:
@@ -305,6 +348,7 @@ def _stale_reason(
     chunks: list[_Chunk],
     base: int,
     have: int,
+    sealer: _Sealer | None = None,
 ) -> str | None:
     """Why the local copy can no longer be extended, or None when it can.
 
@@ -322,7 +366,7 @@ def _stale_reason(
         if _generation(prefix) == recorded:
             return None
         return "the published chunk index changed"
-    if _verify_local(path, base, prefix):
+    if _verify_local(path, base, prefix, sealer):
         return None
     return "the local bytes do not match what the store holds"
 
@@ -367,17 +411,33 @@ def pull(
     store: Store,
     since: str | None = None,
     authors: list[str] | None = None,
+    keyid: str | None = None,
+    allow_legacy: bool = False,
 ) -> PullReport:
     """Fetch every session changed since the cursor and reassemble it locally.
 
     ``since`` overrides the stored cursor (an explicit re-listing); without it
     the cursor from ``pull-state.json`` is used, so a re-run only pays for
-    sessions that actually moved.
+    sessions that actually moved. ``keyid`` scopes the cursor to one keyring
+    entry (see :func:`cursor_scope`); a developer's own pull passes None.
+
+    F1 (contract 6.4, hardened). A wrapped key the caller holds is
+    cryptographic proof a session is encrypted -- the store cannot forge one it
+    would accept. So on the E2E path this pull does *not* trust the session's
+    ``enc`` flag: it fetches the caller's whole wrap set up front and treats it,
+    not the flag, as ground truth. A session it holds a wrap for MUST arrive as
+    aead-v1; a plaintext presentation is a downgrade and is refused on the very
+    first pull, not only after a session has once been recorded encrypted. A
+    session it holds *no* wrap for is not readable on the E2E path: a legacy
+    plaintext one is pulled only when ``allow_legacy`` is set, and then recorded
+    and reported as "unverified". A non-E2E transport (a local directory, a raw
+    ``ezw_`` bearer, an old fake) has no wrap set and no key material, so it
+    keeps the plaintext-only behaviour it always had, ``allow_legacy`` or not.
     """
     report = PullReport()
     state = load_pull_state(store)
     sessions_state: dict[str, Any] = state.setdefault("sessions", {})
-    scope = cursor_scope(authors)
+    scope = cursor_scope(authors, keyid)
     cursor = since if since is not None else read_cursor(state, scope)
 
     try:
@@ -385,6 +445,26 @@ def pull(
     except Exception as exc:  # transport failures are reported, not raised
         report.errors.append(f"listing sessions failed: {exc}")
         return report
+
+    # The E2E path is exactly a transport that can both derive key material
+    # (key_set) and fetch wraps. On it, the wrap set is authoritative over the
+    # enc flag, so it is fetched once here -- if that fetch fails we cannot tell
+    # an honest plaintext session from a downgraded one, so we fail closed
+    # rather than fall back to trusting the flag.
+    key_set = getattr(transport, "key_set", None)
+    e2e = key_set is not None and getattr(transport, "get_wrapped_keys", None) is not None
+    wrapped_sessions: set[str] = set()
+    if e2e:
+        try:
+            held = transport.get_wrapped_keys(None)
+        except Exception as exc:
+            report.errors.append(f"fetching this key's wrapped keys failed: {exc}")
+            return report
+        wrapped_sessions = {
+            str(w.get("session"))
+            for w in (held or [])
+            if isinstance(w, dict) and w.get("session")
+        }
 
     wanted = {a for a in authors} if authors else None
     highest_ok: datetime | None = None
@@ -409,10 +489,35 @@ def pull(
         updated_at = parse_timestamp(row.get("updated_at")) or parse_timestamp(
             row.get("last_ts")
         )
-        before = len(report.errors)
         record = sessions_state.get(session)
-        written, base, generation = _pull_one(
-            transport, store, row, session, author, report, record
+
+        enc = str(row.get("enc") or "")
+        held_wrap = session in wrapped_sessions
+        pinned_encrypted = (
+            isinstance(record, dict) and str(record.get("enc") or "") == ENC_SCHEME
+        )
+        # F1 legacy gate. On the E2E path a session we hold no wrap for is not
+        # readable: a plaintext legacy one is skipped unless the caller opts in.
+        # A held wrap (a downgrade if plaintext) and an already-pinned encrypted
+        # session (also a downgrade if plaintext) are deliberately excluded --
+        # those are judged in _pull_one so they raise, never silently skip.
+        if (
+            e2e
+            and enc != ENC_SCHEME
+            and not held_wrap
+            and not pinned_encrypted
+            and not allow_legacy
+        ):
+            report.skipped.append(
+                f"{author}/{session}: legacy plaintext, no wrapped key for this "
+                f"key -- skipped (pass allow_legacy to pull it as unverified)"
+            )
+            continue
+
+        before = len(report.errors)
+        written, base, generation, pin = _pull_one(
+            transport, store, row, session, author, report, record,
+            held_wrap=held_wrap, e2e=e2e,
         )
         # A partially written session is still incomplete even though the bytes
         # it did write are verified, so any error at all holds the cursor back.
@@ -426,7 +531,8 @@ def pull(
             # The record is written even after a partial failure: it records
             # what is genuinely on disk, which is what the next run resumes from.
             sessions_state[session] = _session_record(
-                store, row, session, author, base=base, generation=generation
+                store, row, session, author, base=base, generation=generation,
+                pin=pin,
             )
 
         if failed:
@@ -439,11 +545,13 @@ def pull(
 
     # A failed session must be re-listed next time, so the cursor never moves
     # past one. Successful sessions re-listed alongside it cost nothing: their
-    # chunks are already on disk and the plan comes back empty.
+    # chunks are already on disk and the plan comes back empty. Written under
+    # the scope that produced it (author filter and, for a keyring pull, the
+    # key) so no other filter's window is ever skipped on its behalf.
     if earliest_failed is not None:
-        state["cursor"] = isoformat(earliest_failed)
+        write_cursor(state, scope, isoformat(earliest_failed))
     elif highest_ok is not None:
-        state["cursor"] = isoformat(highest_ok)
+        write_cursor(state, scope, isoformat(highest_ok))
 
     save_pull_state(store, state)
     return report
@@ -456,12 +564,22 @@ def _session_record(
     author: str,
     base: int = 0,
     generation: str = "",
+    pin: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     path = pulled_path_for(store, author, session)
     size = path.stat().st_size if path.is_file() else 0
     return {
         "session": session,
         "author": author,
+        # The downgrade pin (contract 6.4): once a session is recorded as
+        # aead-v1 at some generation, a store that later reports it plaintext
+        # or at a lower generation is refused, never refetched.
+        "enc": str((pin or {}).get("enc") or ""),
+        "enc_gen": int((pin or {}).get("enc_gen") or 0),
+        "keyid": str((pin or {}).get("keyid") or ""),
+        # F1: a session pulled as legacy plaintext under allow_legacy. Nothing
+        # cryptographic vouches for it, so it is badged for anything reading it.
+        "unverified": bool((pin or {}).get("unverified")),
         "project": row.get("project"),
         "branch": row.get("branch"),
         "title": row.get("title"),
@@ -480,6 +598,102 @@ def _session_record(
     }
 
 
+def _int_or_zero(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _decrypt_context(
+    transport: Transport,
+    session: str,
+    label: str,
+    row_gen: int,
+    report: PullReport,
+) -> tuple[bytes, int, str] | None:
+    """(DK, generation, keyid) for one encrypted session, or None (reported).
+
+    Everything here is duck-typed off the transport because the pull Protocol
+    predates encryption: a transport that cannot supply key material simply
+    cannot decrypt, and says so per session instead of failing the whole pull.
+    """
+    key_set = getattr(transport, "key_set", None)
+    if key_set is None:
+        report.errors.append(
+            f"{label}: cannot decrypt: configure the pasted ezu_/ezr_ key, "
+            f"not a raw bearer"
+        )
+        return None
+
+    # The chunk listing's generation is fresher than the session row's; use it
+    # when the transport can supply it, so a rotation between the two requests
+    # is caught here as a mismatch rather than later as a tag failure.
+    gen = row_gen
+    probe = getattr(transport, "session_enc", None)
+    if probe is not None:
+        try:
+            _, listed_gen = probe(session)
+        except Exception as exc:
+            report.errors.append(f"{label}: reading encryption metadata failed: {exc}")
+            return None
+        gen = listed_gen or gen
+
+    fetch = getattr(transport, "get_wrapped_keys", None)
+    if fetch is None:
+        report.errors.append(
+            f"{label}: this transport cannot fetch wrapped keys; cannot decrypt"
+        )
+        return None
+    try:
+        wraps = fetch(session)
+    except Exception as exc:
+        report.errors.append(f"{label}: fetching the wrapped key failed: {exc}")
+        return None
+    if not wraps:
+        report.errors.append(
+            f"{label}: no wrapped key for this key on the store -- this key "
+            f"cannot open this session"
+        )
+        return None
+    wrap_row = wraps[0]
+    wrap_gen = _int_or_zero(wrap_row.get("enc_gen"))
+    if gen and wrap_gen != gen:
+        # A rotation in flight: the wrap and the chunks describe different
+        # generations. Per-session error, cursor held, next pull retries.
+        report.errors.append(
+            f"{label}: wrapped key is for generation {wrap_gen} but the "
+            f"session is at {gen} (rotation in flight) -- retrying next pull"
+        )
+        return None
+    gen = wrap_gen if wrap_gen else gen
+    if gen < 1:
+        report.errors.append(f"{label}: encrypted session reports no generation")
+        return None
+
+    # The unwrap AAD is bound to *our* recipient id (device or reader row
+    # UUID). A device carries it in config; a reader learns it from the GET
+    # response itself (transport caches it -- contract Q2).
+    recipient = str(getattr(transport, "recipient_id", "") or "")
+    if not recipient:
+        report.errors.append(
+            f"{label}: cannot determine this key's recipient id for unwrap"
+        )
+        return None
+    try:
+        dk = unwrap_dk(
+            key_set.enc_key,
+            session,
+            recipient,
+            gen,
+            base64.b64decode(str(wrap_row.get("wrap") or "")),
+        )
+    except (CryptoError, ValueError) as exc:
+        report.errors.append(f"{label}: cannot unwrap the session data key: {exc}")
+        return None
+    return dk, gen, str(getattr(key_set, "keyid", "") or "")
+
+
 def _pull_one(
     transport: Transport,
     store: Store,
@@ -488,23 +702,64 @@ def _pull_one(
     author: str,
     report: PullReport,
     record: dict[str, Any] | None,
-) -> tuple[int | None, int, str]:
+    *,
+    held_wrap: bool = False,
+    e2e: bool = False,
+) -> tuple[int | None, int, str, dict[str, Any]]:
     """Append this session's new bytes.
 
-    Returns ``(written, base, generation)`` -- written is None on error.
+    Returns ``(written, base, generation, pin)`` -- written is None on error.
     ``base`` is where the published document begins: a session shared mid-way
     starts at its opt-in watermark, so the leading gap ``[0, base)`` is the
     consent boundary, not missing data. Holes *between* chunks stay fatal.
+    ``pin`` is the encryption state to record (see the downgrade pin below).
+
+    ``held_wrap`` is True when the caller holds a wrapped key for this session
+    (F1: proof it is encrypted); ``e2e`` is True when the transport is on the
+    E2E path at all. Both come from :func:`pull`, which owns the wrap set.
     """
     label = f"{author}/{session}"
     target = pulled_path_for(store, author, session)
     target.parent.mkdir(parents=True, exist_ok=True)
 
+    enc = str(row.get("enc") or "")
+    row_gen = _int_or_zero(row.get("enc_gen"))
+    no_pin: dict[str, Any] = {}
+
+    # Downgrade pin (contract 6.4): a session once pulled as aead-v1 that the
+    # store later reports as plaintext, or at a lower generation, is an ERROR
+    # -- never a refetch. That shape is a malicious or corrupted store, and
+    # accepting plaintext would let the operator substitute forged
+    # transcripts for bytes the GCM tags used to authenticate.
+    pinned_enc = str(record.get("enc") or "") if isinstance(record, dict) else ""
+    pinned_gen = _int_or_zero(record.get("enc_gen")) if isinstance(record, dict) else 0
+    if pinned_enc == ENC_SCHEME and enc != ENC_SCHEME:
+        report.errors.append(
+            f"{label}: this session was pulled encrypted but the store now "
+            f"reports it as plaintext -- refusing (possible tampering)"
+        )
+        return None, 0, "", no_pin
+
+    # F1 first-use pin. The record pin above only fires once a session has
+    # already been recorded aead-v1 -- it cannot protect the very first pull,
+    # the trust-on-first-use hole. A wrapped key this caller holds closes it:
+    # the store cannot forge a wrap the caller's own K_enc would unwrap, so
+    # holding one is unforgeable proof the session is encrypted. If the store
+    # then presents it as plaintext, that is a downgrade attempt -- refuse
+    # before a single forged plaintext byte is appended, first pull or not.
+    if held_wrap and enc != ENC_SCHEME:
+        report.errors.append(
+            f"{label}: a wrapped key for this key proves this session is "
+            f"encrypted, but the store presents it as plaintext -- refusing "
+            f"(downgrade attempt)"
+        )
+        return None, 0, "", no_pin
+
     try:
         chunk_rows = transport.list_chunks(session)
     except Exception as exc:
         report.errors.append(f"{label}: listing chunks failed: {exc}")
-        return None, 0, ""
+        return None, 0, "", no_pin
 
     chunks, problems = _parse_chunks(
         chunk_rows if isinstance(chunk_rows, list) else [], session
@@ -512,9 +767,48 @@ def _pull_one(
     for problem in problems:
         report.errors.append(f"{label}: {problem}")
     if problems:
-        return None, 0, ""
+        return None, 0, "", no_pin
     if not chunks:
-        return 0, 0, ""
+        return 0, 0, "", no_pin
+
+    dk: bytes | None = None
+    gen = 0
+    keyid = ""
+    if enc == ENC_SCHEME:
+        context = _decrypt_context(transport, session, label, row_gen, report)
+        if context is None:
+            return None, 0, "", no_pin
+        dk, gen, keyid = context
+        if pinned_enc == ENC_SCHEME and gen < pinned_gen:
+            report.errors.append(
+                f"{label}: the store reports generation {gen} but generation "
+                f"{pinned_gen} was already pulled -- refusing (possible tampering)"
+            )
+            return None, 0, "", no_pin
+
+    # A legacy plaintext session reached here only because the caller opted into
+    # legacy (pull() skips it otherwise) and we hold no wrap for it. Nothing
+    # cryptographic vouches for its bytes, so it is recorded and reported as
+    # unverified rather than silently trusted. Its record deliberately carries
+    # enc="" so it can never masquerade as a pinned encrypted session later.
+    unverified = e2e and enc != ENC_SCHEME and not held_wrap
+    if unverified:
+        report.unverified.append(
+            f"{label}: pulled as unverified plaintext (legacy, no wrapped key)"
+        )
+    if enc:
+        pin = {"enc": enc, "enc_gen": gen, "keyid": keyid, "unverified": False}
+    elif unverified:
+        pin = {"enc": "", "enc_gen": 0, "keyid": "", "unverified": True}
+    else:
+        pin = no_pin
+
+    sealer: _Sealer | None = None
+    if dk is not None:
+        held_dk, held_gen = dk, gen
+        sealer = lambda offset, data: encrypt_chunk(  # noqa: E731
+            held_dk, session, held_gen, offset, data
+        )
 
     base = chunks[0].offset
 
@@ -532,7 +826,7 @@ def _pull_one(
             # way the local file's byte 0 no longer means what it did.
             stale = "the published document now starts at a different offset"
         else:
-            stale = _stale_reason(target, record, chunks, base, have)
+            stale = _stale_reason(target, record, chunks, base, have, sealer)
         if stale:
             # Splicing across a generation would produce one document's head
             # on another's tail; a refetch is cheap and provably right. Counted,
@@ -546,9 +840,9 @@ def _pull_one(
     for gap in gaps:
         report.errors.append(f"{label}: {gap}")
     if gaps:
-        return None, base, ""
+        return None, base, "", pin
     if not plan:
-        return 0, base, _generation_on_disk(chunks, base, have)
+        return 0, base, _generation_on_disk(chunks, base, have), pin
 
     written = 0
     with target.open("ab") as handle:
@@ -560,10 +854,13 @@ def _pull_one(
                     f"{label}: fetching chunk at offset {chunk.offset} failed: {exc}"
                 )
                 break
-            if len(body) != chunk.length:
+            # Offsets and lengths are plaintext addressing on every session;
+            # an encrypted body carries a 16-byte GCM tag on top (contract 3.2).
+            expected = chunk.length + (GCM_TAG if dk is not None else 0)
+            if len(body) != expected:
                 report.errors.append(
                     f"{label}: chunk at offset {chunk.offset} is {len(body)} bytes, "
-                    f"expected {chunk.length} -- NOT appended"
+                    f"expected {expected} -- NOT appended"
                 )
                 break
             digest = hashlib.sha256(body).hexdigest()
@@ -573,6 +870,19 @@ def _pull_one(
                     f"(got {digest[:12]}, expected {chunk.sha256[:12]}) -- NOT appended"
                 )
                 break
+            if dk is not None:
+                # The checksum above proved transport integrity of the
+                # ciphertext; the GCM tag now proves authenticity and binds
+                # the bytes to (session, gen, offset), so a chunk moved
+                # between sessions or offsets dies here.
+                try:
+                    body = decrypt_chunk(dk, session, gen, chunk.offset, body)
+                except CryptoError as exc:
+                    report.errors.append(
+                        f"{label}: chunk at offset {chunk.offset} failed "
+                        f"decryption ({exc}) -- NOT appended"
+                    )
+                    break
             handle.write(body)
             # Flushed per chunk so the file length always reflects verified
             # bytes only: a crash mid-run leaves a short file, never a torn one.
@@ -591,11 +901,11 @@ def _pull_one(
             f"session reports only {reported} -- the local copy may contain "
             f"duplicated bytes"
         )
-        return None, base, ""
+        return None, base, "", pin
     generation = _generation_on_disk(chunks, base, final)
     if written == 0:
-        return (None, base, "") if plan else (0, base, generation)
-    return written, base, generation
+        return (None, base, "", pin) if plan else (0, base, generation, pin)
+    return written, base, generation, pin
 
 
 def _generation_on_disk(chunks: list[_Chunk], base: int, size: int) -> str:
@@ -651,6 +961,9 @@ def pulled_sessions(store: Store) -> list[dict[str, Any]]:
                 "reported_size": record.get("reported_size"),
                 "present": exists,
                 "pulled_at": record.get("pulled_at"),
+                # Legacy plaintext pulled under allow_legacy: no cryptographic
+                # provenance, so downstream renders it with a visible badge.
+                "unverified": bool(record.get("unverified")),
             }
         )
     rows.sort(key=lambda r: str(r.get("last_timestamp") or ""), reverse=True)

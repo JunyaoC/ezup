@@ -46,6 +46,15 @@ CREATE TABLE IF NOT EXISTS devices (
 -- trip through the client's own date formatter, and Python's isoformat
 -- (microseconds, +00:00) does not order lexically against JS toISOString
 -- (milliseconds, Z). A number is the only representation both agree on.
+--
+-- `enc` / `enc_gen` are the E2E markers (docs/E2E-CONTRACT.md §4). NULL enc =
+-- legacy plaintext session; 'aead-v1' = chunk bodies are client-side
+-- AES-256-GCM ciphertext, `length + 16` bytes for a `length`-byte plaintext
+-- range. `enc_gen` is the current AEAD generation (0 = plaintext): clients
+-- derive nonces from (enc_gen, offset), so the server's only job is to keep it
+-- monotonic -- enc may go NULL -> 'aead-v1' and never back, enc_gen may never
+-- decrease. The worker cannot decrypt either way; these columns exist so pull
+-- and the viewer know which decode path a session takes.
 CREATE TABLE IF NOT EXISTS sessions (
   session    TEXT PRIMARY KEY,
   device_id  TEXT,
@@ -59,7 +68,9 @@ CREATE TABLE IF NOT EXISTS sessions (
   size       INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL,
   updated_ms INTEGER NOT NULL DEFAULT 0,
-  deleted_at TEXT
+  deleted_at TEXT,
+  enc        TEXT,
+  enc_gen    INTEGER NOT NULL DEFAULT 0
 );
 
 -- The append-only chunk index. PRIMARY KEY(session, offset) is what makes an
@@ -75,6 +86,25 @@ CREATE TABLE IF NOT EXISTS chunks (
   key        TEXT NOT NULL,
   created_at TEXT NOT NULL,
   PRIMARY KEY (session, "offset")
+);
+
+-- One wrapped data key per (session, recipient). Opaque to the server: `wrap`
+-- is base64 of a 60-byte blob (12 nonce + 32 ct + 16 tag) sealed under the
+-- recipient's key-encryption key, which never exists server-side. The server
+-- can neither read nor usefully forge these -- a forged wrap fails the
+-- recipient's GCM tag, whose AAD binds session, recipient and generation.
+-- `recipient_id` is a devices.id: the owning device itself (the self-wrap that
+-- lets a device recover every DK from its pasted key alone) or a reader it
+-- minted. Rotation (enc_gen bump) overwrites the row; session deletion
+-- cascades in DELETE /v1/session. No foreign keys, same as everywhere else:
+-- D1 batches are the consistency mechanism here.
+CREATE TABLE IF NOT EXISTS wrapped_keys (
+  session      TEXT NOT NULL,
+  recipient_id TEXT NOT NULL,          -- devices.id (device itself or reader)
+  enc_gen      INTEGER NOT NULL,
+  wrap         TEXT NOT NULL,          -- base64 of the 60-byte wrap blob
+  created_at   TEXT NOT NULL,
+  PRIMARY KEY (session, recipient_id)
 );
 
 -- Failed POST /v1/device attempts, bucketed by client IP. One correct guess of
@@ -97,3 +127,6 @@ CREATE INDEX IF NOT EXISTS idx_chunks_session ON chunks (session);
 CREATE INDEX IF NOT EXISTS idx_devices_scope ON devices (scoped_device_id);
 -- GET /v1/blob?key= resolves a key back to its session before serving bytes.
 CREATE INDEX IF NOT EXISTS idx_chunks_key ON chunks (key);
+-- GET /v1/wrapped_keys (no ?session=) is the bulk recovery/backfill path: all
+-- wraps addressed to the authenticated caller.
+CREATE INDEX IF NOT EXISTS idx_wrapped_recipient ON wrapped_keys (recipient_id);
