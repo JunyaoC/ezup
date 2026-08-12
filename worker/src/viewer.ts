@@ -579,13 +579,27 @@ function renderTranscript(log, text) {
   start = from;
   if (start > 0) sentinel.textContent = "▲ " + start + " earlier turn(s) — scroll up to load";
   else sentinel.remove();
-  pane.scrollTop = pane.scrollHeight;    // open at the newest turn
 
   // Load older turns when the top sentinel scrolls into view.
   const obs = new IntersectionObserver((entries) => {
-    if (entries.some(e => e.isIntersecting)) prepend();
+    if (ready && entries.some(e => e.isIntersecting)) prepend();
   }, { root: pane, rootMargin: "300px" });
-  if (start > 0) obs.observe(sentinel);
+
+  // Pin to the newest turn. scrollHeight is not final until the browser has
+  // laid out the pre-wrapped text, so scroll on the next frame (twice, to
+  // survive a late reflow), and only arm the "load older" observer afterwards
+  // so that initial jump to the bottom is never interrupted by a prepend.
+  let ready = false;
+  const toBottom = () => { pane.scrollTop = pane.scrollHeight; };
+  toBottom();
+  requestAnimationFrame(() => {
+    toBottom();
+    requestAnimationFrame(() => {
+      toBottom();
+      ready = true;
+      if (start > 0) obs.observe(sentinel);
+    });
+  });
 }
 
 // --- Router: #s/<session> is the reading pane, empty hash is the list -----
