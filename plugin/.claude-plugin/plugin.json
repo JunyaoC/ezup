@@ -1,0 +1,10 @@
+{
+  "name": "ezupdate",
+  "description": "Consent-gated session sharing for teams: opt a session in with /ezupdate on, and its transcript syncs incrementally to your team store for the PM to journal. Off by default; installing shares nothing.",
+  "version": "0.1.0",
+  "author": {
+    "name": "JunyaoC",
+    "url": "https://github.com/JunyaoC/ez-change-log"
+  },
+  "homepage": "https://github.com/JunyaoC/ez-change-log"
+}

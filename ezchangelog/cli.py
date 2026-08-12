@@ -995,6 +995,16 @@ def cmd_statusline(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_hook_run(args: argparse.Namespace) -> int:
+    """The stable entry the Claude Code plugin calls on every hook fire.
+
+    Exists so the plugin can say `ezcl hook-run` and inherit hook_entry's
+    never-raise guarantee, rather than needing to know which python owns the
+    ezchangelog package.
+    """
+    return hook_entry.main([])
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ezcl",
@@ -1219,6 +1229,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="read hook JSON on stdin and print the one-line sharing indicator",
     )
     statusline_parser.set_defaults(func=cmd_statusline)
+
+    hook_run_parser = subparsers.add_parser(
+        "hook-run",
+        help="process one hook event from stdin (used by the Claude Code plugin)",
+    )
+    hook_run_parser.set_defaults(func=cmd_hook_run)
 
     token_parser = subparsers.add_parser(
         "token",

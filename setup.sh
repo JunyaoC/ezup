@@ -55,6 +55,18 @@ VIRTUAL_ENV="$HERE/.venv" uv pip install --quiet -e .
 ok "ezchangelog installed (editable)"
 ok "$(.venv/bin/python -c 'import ezchangelog; print("version " + ezchangelog.__version__)')"
 
+# -- 3b. ezcl on PATH --------------------------------------------------------
+step "ezcl on PATH"
+# Claude Code's `!` shell and the plugin's hook shim both look for `ezcl` on
+# PATH; the venv alone is invisible to them.
+mkdir -p "$HOME/.local/bin"
+ln -sf "$HERE/.venv/bin/ezcl" "$HOME/.local/bin/ezcl"
+if command -v ezcl >/dev/null 2>&1; then
+  ok "~/.local/bin/ezcl -> .venv/bin/ezcl"
+else
+  warn '~/.local/bin is not on PATH; add: export PATH="$HOME/.local/bin:$PATH"'
+fi
+
 # -- 4. the Claude CLI -------------------------------------------------------
 step "claude CLI"
 if command -v claude >/dev/null 2>&1; then
