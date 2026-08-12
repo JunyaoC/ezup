@@ -1099,8 +1099,15 @@ async function listSessions(env: Env, url: URL, device: Device): Promise<Respons
   const columns = `session, author, project, branch, cwd, title,
                    first_ts, last_ts, size, updated_at, enc, enc_gen`;
   const order = "ORDER BY updated_ms ASC, session ASC LIMIT ?2";
+
+  // The listing must honour the SAME scope as canRead(): a plain device sees
+  // its own sessions, a device-minted reader sees only its minter's, and only
+  // the admin-minted global reader (scope null) sees everyone. Listing wider
+  // than that leaks every session's author/project/title to a scoped reader --
+  // metadata the reader can never decrypt but must not even see.
+  const scope = readScope(device);
   const listed =
-    device.role === "reader"
+    scope === null
       ? await env.DB.prepare(
           `SELECT ${columns} FROM sessions
             WHERE deleted_at IS NULL AND updated_ms >= ?1 ${order}`,
@@ -1111,7 +1118,7 @@ async function listSessions(env: Env, url: URL, device: Device): Promise<Respons
           `SELECT ${columns} FROM sessions
             WHERE deleted_at IS NULL AND updated_ms >= ?1 AND device_id = ?3 ${order}`,
         )
-          .bind(sinceMs, SESSION_PAGE, device.id)
+          .bind(sinceMs, SESSION_PAGE, scope)
           .all();
 
   return json({ sessions: listed.results ?? [] });
