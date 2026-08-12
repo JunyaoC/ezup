@@ -1179,6 +1179,14 @@ async function getBlob(env: Env, url: URL, device: Device): Promise<Response> {
   headers.set("content-type", "application/x-ndjson");
   headers.set("content-length", String(object.size));
   headers.set("etag", object.httpEtag);
+  // A chunk is immutable: its R2 key encodes the byte range, so the bytes at
+  // this URL never change. Let the caller's OWN browser cache it (private, not
+  // a shared CDN -- these are ciphertext but still scoped, and Vary keeps one
+  // browser's cache from answering a different token). Re-opening a session is
+  // then served from cache with no re-download. The client also caches the
+  // decrypted text in memory, so this mainly helps after a refresh.
+  headers.set("cache-control", "private, max-age=604800, immutable");
+  headers.set("vary", "authorization");
   return new Response(object.body, { headers });
 }
 

@@ -114,7 +114,11 @@ position:sticky;top:0;z-index:2}
 .crumb .sep{color:var(--line-3)}
 .crumb .back{color:var(--muted);font-family:var(--mono);font-size:12px}
 .crumb .back:hover{color:var(--ink)}
-.reader{overflow-y:auto;flex:1;padding:22px 26px 80px;max-width:920px;width:100%}
+.reader{overflow-y:auto;flex:1;padding:22px 34px 80px;width:100%}
+.tbtn{margin-left:auto;font-family:var(--mono);font-size:12px;color:var(--muted);
+border:1px solid var(--line-2);background:var(--bg);border-radius:var(--r-sm);padding:5px 11px}
+.tbtn:hover{border-color:var(--ink);color:var(--ink)}
+.tbtn.spin{opacity:.5;pointer-events:none}
 
 .banner{border:1px solid var(--line-2);background:var(--panel);border-radius:var(--r);
 padding:9px 13px;font-size:12.5px;margin-bottom:14px;color:var(--ink-2)}
@@ -177,7 +181,8 @@ font-family:var(--mono);line-height:1.7}
     <div class="side-foot" id="foot"></div>
   </aside>
   <main>
-    <div class="topbar"><div class="crumb" id="crumb"></div></div>
+    <div class="topbar"><div class="crumb" id="crumb"></div>
+      <button class="tbtn" id="refresh" title="reload from the store">↻ refresh</button></div>
     <div class="reader" id="reader"></div>
   </main>
 </div>
@@ -274,6 +279,12 @@ let SHOW_LEGACY = false;
 let KEYS = [];
 let MODEL = new Map();     // session id -> row
 let ROWS = [];
+// Decrypted transcripts, cached in memory for this page's lifetime so
+// switching between sessions (or back-and-forth) is instant and never
+// re-fetches or re-decrypts. Keyed by session id; a growing session's newest
+// bytes are picked up on refresh, which clears this. Plaintext lives only in
+// this tab's memory, never on disk or the wire.
+const DEC_CACHE = new Map();
 
 function persist() {
   const raw = JSON.stringify(KEYS.map(k => ({ token: k.token, label: k.label })));
@@ -435,6 +446,8 @@ function tailBanner(total, skipped) {
 }
 
 async function fetchDecrypted(r, enc) {
+  const cached = DEC_CACHE.get(r.session);
+  if (cached) return cached;
   const wk = enc ? r.wrapKeys[0] : null;
   const k = enc ? wk.key : r.listKeys[0];
   const man = await (await api("/v1/chunks?session=" + encodeURIComponent(r.session), k.bearer)).json();
@@ -471,7 +484,9 @@ async function fetchDecrypted(r, enc) {
   }
   let text = parts.join("");
   if (skipped) text = text.slice(text.indexOf("\\n") + 1);
-  return { text, total, skipped, key: k };
+  const result = { text, total, skipped, key: k };
+  DEC_CACHE.set(r.session, result);
+  return result;
 }
 
 async function renderEncrypted(r) {
@@ -594,6 +609,12 @@ window.addEventListener("hashchange", () => {
 
   document.getElementById("addkey").onclick = addKey;
   document.getElementById("newkey").onkeydown = (e) => { if (e.key === "Enter") addKey(); };
+  const rb = document.getElementById("refresh");
+  rb.onclick = async () => {
+    rb.classList.add("spin");
+    DEC_CACHE.clear();                 // re-pull ciphertext, pick up new turns
+    try { await refresh(); } finally { rb.classList.remove("spin"); }
+  };
   const tab = document.getElementById("tabonly"); tab.checked = TAB_ONLY;
   tab.onchange = (e) => { TAB_ONLY = e.target.checked; localStorage.setItem("ezup_tabonly", TAB_ONLY?"1":"0"); persist(); };
   document.getElementById("legacy").onchange = (e) => { SHOW_LEGACY = e.target.checked; refresh(); };
