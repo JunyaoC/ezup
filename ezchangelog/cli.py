@@ -760,11 +760,16 @@ def cmd_unpublish(args: argparse.Namespace) -> int:
 def cmd_sync(args: argparse.Namespace) -> int:
     store = _store_for(args)
     now = datetime.now(timezone.utc)
-    try:
-        since = since_to_datetime(args.window, now)
-    except ValueError as error:
-        print(f"error: {error}", file=sys.stderr)
-        return 2
+    if args.window.strip().lower() == "all":
+        # Everything ever recorded. Safe to offer because sync never
+        # pre-ticks anything: "all" widens the LIST, not the selection.
+        since = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    else:
+        try:
+            since = since_to_datetime(args.window, now)
+        except ValueError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 2
 
     result = collect(
         normalize_roots(args.directories),
@@ -1182,7 +1187,7 @@ def build_parser() -> argparse.ArgumentParser:
         "window",
         nargs="?",
         default="7d",
-        help="how far back to look: 7d, 24h, 2w, or a date; default 7d",
+        help="how far back to look: 7d, 24h, 2w, a date, or 'all'; default 7d",
     )
     sync_parser.add_argument(
         "directories",

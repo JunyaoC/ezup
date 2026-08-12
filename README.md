@@ -79,7 +79,7 @@ reading as two.
 On a fresh machine:
 
 ```bash
-git clone <this repo> && cd ez-change-log
+git clone https://github.com/JunyaoC/ezup && cd ezup
 ./setup.sh
 ```
 
@@ -105,8 +105,8 @@ falls back to system `python3` and still works.
 The dev-side hook ships as a plugin. Install it from this repo:
 
 ```
-/plugin marketplace add JunyaoC/ez-change-log
-/plugin install ezup@ez-change-log
+/plugin marketplace add JunyaoC/ezup
+/plugin install ezup@ezup
 ```
 
 Then, inside any session you want to share:
