@@ -1237,12 +1237,10 @@ def cmd_device(args: argparse.Namespace) -> int:
         print(f"error: no store configured; set ${STORE_ENV} or a store in "
               f"<store>/config.json", file=sys.stderr)
         return 2
-    admin = _admin_token(args)
-    if not admin:
-        print("error: device minting is admin-gated; provide the admin token via "
-              "--admin-token, $EZUP_ADMIN_TOKEN, or ~/.ezchangelog/admin-token",
-              file=sys.stderr)
-        return 2
+    # No admin token needed when the store allows open enrollment; if it is
+    # admin-gated the server returns 401/403 and register_device's error already
+    # says to supply one. So we send whatever we have (possibly empty).
+    admin = _admin_token(args) or ""
 
     # Enrolling writes config.json. If this machine is already a device,
     # overwriting it orphans every session that device owns (only the owning
@@ -1608,7 +1606,10 @@ def cmd_pull(args: argparse.Namespace) -> int:
     # unchanged.
     entries = _keyring_entries(_load_keyring(store))
     if entries:
-        return _pull_keyring(args, store, entries, allow_legacy)
+        code = _pull_keyring(args, store, entries, allow_legacy)
+        if code == 0:
+            code = _journal_after_pull(args, store)
+        return code
 
     config = load_config(store, os.getcwd())
     try:
@@ -1645,10 +1646,47 @@ def cmd_pull(args: argparse.Namespace) -> int:
         f"pulled   {store.root / 'pulled'}",
     ]
     lines += [f"ERROR    {problem}" for problem in report.errors]
-    if report.ok and (report.sessions_new or report.sessions_updated):
-        lines.append("run `ezcl collect --include-pulled -i` to journal them")
     _emit(payload, args.json, lines)
-    return 0 if report.ok else 1
+    if not report.ok:
+        return 1
+    return _journal_after_pull(args, store)
+
+
+def _journal_after_pull(args: argparse.Namespace, store: Store) -> int:
+    """After a successful fetch, journal the pulled sessions -- unless asked not
+    to. This is what makes `ezup pull` the PM's single command: fetch + report.
+    The window defaults to 7 days; `--no-journal` (the runner) skips it.
+    """
+    if getattr(args, "no_journal", False):
+        return 0
+    window = str(getattr(args, "window", None) or "7d").strip()
+    if window.isdigit():
+        window = f"{window}d"        # bare "14" means 14 days
+    elif window.lower() == "all":
+        window = "2020-01-01"        # everything ezup could plausibly hold
+    # Reuse the collect+pipeline path with a constructed namespace: pull over the
+    # pulled sessions for the window, take them all, no picker.
+    collect_args = argparse.Namespace(
+        directories=[],
+        since=window,
+        until=None,
+        no_recursive=False,
+        match="any",
+        min_turns=1,
+        min_tools=1,
+        interactive=False,
+        yes=True,
+        dry_run=False,
+        stop_before_model=False,
+        refresh=False,
+        quiet=getattr(args, "quiet", False),
+        limit=30,
+        json=False,
+        no_journal=False,
+        include_pulled=True,
+        store=getattr(args, "store", None),
+    )
+    return cmd_collect(collect_args)
 
 
 def cmd_keyring(args: argparse.Namespace) -> int:
@@ -2034,6 +2072,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="also pull legacy plaintext sessions (no encryption, no wrapped "
         "key); off by default because such bytes are unverified -- the store "
         "operator could have substituted them",
+    )
+    pull_parser.add_argument(
+        "window",
+        nargs="?",
+        default="7d",
+        help="how far back to journal after fetching: 7d, 30d, a date, or "
+        "'all'; default 7d. Bare number = days (e.g. 14).",
+    )
+    pull_parser.add_argument(
+        "--no-journal",
+        action="store_true",
+        help="fetch only; do not build a journal (what the runner uses)",
     )
     pull_parser.add_argument("--json", action="store_true")
     pull_parser.set_defaults(func=cmd_pull)

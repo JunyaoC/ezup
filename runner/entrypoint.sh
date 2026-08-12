@@ -139,7 +139,7 @@ fi
 # The keyring loop: one authenticated pull per reader key, decrypting each
 # teammate's shared sessions into <store>/pulled/<author>/*.jsonl.
 log "pull: fetching shared sessions for every keyring reader"
-ezup pull
+ezup pull --no-journal
 ok "pull: complete"
 
 # -- 3. collect + journal ----------------------------------------------------

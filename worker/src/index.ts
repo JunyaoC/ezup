@@ -45,8 +45,12 @@ import { VIEWER_HTML } from "./viewer";
 export interface Env {
   BUCKET: R2Bucket;
   DB: D1Database;
-  /** Secret. Only gates POST /v1/device; absent means device minting is off. */
+  /** Secret gating POST /v1/device unless OPEN_ENROLLMENT is set. */
   ADMIN_TOKEN?: string;
+  /** When truthy (1/true/yes/on), anyone may enrol a device with no admin
+   *  token. A new device sees only its own sessions, so this is a spam surface,
+   *  never a confidentiality one. */
+  OPEN_ENROLLMENT?: string;
 }
 
 /** Worker request bodies can reach 100 MB, but a chunk that large would sit in
@@ -359,33 +363,42 @@ async function adminLockoutSeconds(env: Env, ip: string, now: number): Promise<n
 }
 
 async function createDevice(request: Request, env: Env): Promise<Response> {
+  // Enrollment policy. When OPEN_ENROLLMENT is truthy the store lets anyone
+  // create a device with no admin token: a new device can only ever see its
+  // OWN sessions (reading anyone else's needs a wrap it will never be granted),
+  // so open enrollment is a storage/spam surface, never a confidentiality one.
+  // Otherwise it stays admin-gated. The owner chooses by setting the env var.
+  const open = /^(1|true|yes|on)$/i.test(env.OPEN_ENROLLMENT ?? "");
   const admin = env.ADMIN_TOKEN;
-  if (!admin) return fail(503, "device minting disabled: ADMIN_TOKEN is not set");
 
-  const ip = clientIp(request);
-  const now = Date.now();
-  const waitFor = await adminLockoutSeconds(env, ip, now);
-  if (waitFor > 0) {
-    console.warn(`POST /v1/device locked out ip=${ip} retry_after=${waitFor}s`);
-    return fail(429, "too many failed admin attempts", { "retry-after": String(waitFor) });
-  }
+  if (!open) {
+    if (!admin) return fail(503, "device minting disabled: set OPEN_ENROLLMENT or ADMIN_TOKEN");
 
-  const supplied = bearer(request);
-  // Hash both sides first: equal-length digests make the compare constant time
-  // regardless of how long the guessed token was.
-  const [suppliedDigest, adminDigest] = await Promise.all([
-    sha256Hex(supplied ?? ""),
-    sha256Hex(admin),
-  ]);
-  if (!supplied || !constantTimeEqual(suppliedDigest, adminDigest)) {
-    const lockedUntil = await recordAdminFailure(env, ip, now);
-    // Never the token, not even its digest -- a digest of a nearly-correct
-    // guess is still a guess worth grinding offline. IP and count only.
-    console.warn(
-      `POST /v1/device auth failure ip=${ip} reason=${supplied ? "bad-token" : "no-token"}` +
-        (lockedUntil && lockedUntil > now ? " locked=yes" : ""),
-    );
-    return supplied ? fail(403, "forbidden") : fail(401, "missing bearer token");
+    const ip = clientIp(request);
+    const now = Date.now();
+    const waitFor = await adminLockoutSeconds(env, ip, now);
+    if (waitFor > 0) {
+      console.warn(`POST /v1/device locked out ip=${ip} retry_after=${waitFor}s`);
+      return fail(429, "too many failed admin attempts", { "retry-after": String(waitFor) });
+    }
+
+    const supplied = bearer(request);
+    // Hash both sides first: equal-length digests make the compare constant time
+    // regardless of how long the guessed token was.
+    const [suppliedDigest, adminDigest] = await Promise.all([
+      sha256Hex(supplied ?? ""),
+      sha256Hex(admin),
+    ]);
+    if (!supplied || !constantTimeEqual(suppliedDigest, adminDigest)) {
+      const lockedUntil = await recordAdminFailure(env, ip, now);
+      // Never the token, not even its digest -- a digest of a nearly-correct
+      // guess is still a guess worth grinding offline. IP and count only.
+      console.warn(
+        `POST /v1/device auth failure ip=${ip} reason=${supplied ? "bad-token" : "no-token"}` +
+          (lockedUntil && lockedUntil > now ? " locked=yes" : ""),
+      );
+      return supplied ? fail(403, "forbidden") : fail(401, "missing bearer token");
+    }
   }
 
   const body = await readJson(request);
@@ -431,8 +444,12 @@ async function createDevice(request: Request, env: Env): Promise<Response> {
   }
   if (!created) return fail(500, "device was not created");
 
-  // A correct admin token clears the guessing counter for that IP.
-  await env.DB.prepare("DELETE FROM admin_failures WHERE ip = ?1").bind(ip).run();
+  // A correct admin token clears the guessing counter for that IP. Skipped
+  // under open enrollment, where no admin check ran and `ip` was never bound.
+  if (!open) {
+    await env.DB.prepare("DELETE FROM admin_failures WHERE ip = ?1")
+      .bind(clientIp(request)).run();
+  }
 
   // No token in the response, ever again: the server never saw one. The id is
   // what the client records as device_id (it is the recipient of self-wraps).
