@@ -1,0 +1,16 @@
+{
+  // Runtime types come from ./worker-configuration.d.ts, which `npx wrangler types`
+  // generates from wrangler.jsonc -- that keeps wrangler the only dependency.
+  "compilerOptions": {
+    "target": "es2022",
+    "lib": ["es2022"],
+    "module": "es2022",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "types": []
+  },
+  "include": ["src/**/*.ts", "worker-configuration.d.ts"]
+}

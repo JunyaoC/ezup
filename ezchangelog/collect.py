@@ -28,6 +28,13 @@ class Selection:
     stored_path: str | None = None
     copied: bool = False
     window_days: list[str] = field(default_factory=list)
+    # Empty for sessions this machine recorded; the teammate's name for ones
+    # pulled from the team store. Everything downstream treats the two alike,
+    # so the author is the only thing that distinguishes them.
+    author: str = ""
+    pulled: bool = False
+    # Filled in by `ezcl sync` from the publish state, purely for display.
+    synced: str = ""
 
     @property
     def last_active(self) -> str:
@@ -100,6 +107,8 @@ class CollectResult:
                     "match_reason": selection.match_reason,
                     "stored_path": selection.stored_path,
                     "copied_this_run": selection.copied,
+                    "author": selection.author,
+                    "pulled": selection.pulled,
                 }
                 for selection in self.selected
             ],
@@ -185,6 +194,114 @@ def overlaps_window(
     return first <= until and last >= since
 
 
+def _facts_for(
+    path: Path,
+    sources: dict[str, Any],
+    signature: dict[str, Any],
+    refresh: bool,
+) -> tuple[SessionFacts, bool]:
+    """Facts for one transcript, reusing the index when the file is unchanged.
+
+    Returns ``(facts, reused)``. The index entry is created or refreshed as a
+    side effect, exactly as the scan loop needs it.
+    """
+    key = str(path)
+    cached = sources.get(key)
+    unchanged = (
+        not refresh
+        and isinstance(cached, dict)
+        and cached.get("signature") == signature
+        and isinstance(cached.get("facts"), dict)
+    )
+    if unchanged:
+        return (
+            SessionFacts(**{
+                field_name: cached["facts"][field_name]
+                for field_name in SessionFacts.__dataclass_fields__
+                if field_name in cached["facts"]
+            }),
+            True,
+        )
+
+    facts = scan_transcript(path)
+    sources[key] = {
+        "signature": signature,
+        "facts": facts.to_dict(),
+        "stored_path": (cached or {}).get("stored_path"),
+        "ingested_at": (cached or {}).get("ingested_at"),
+        "ingested_signature": (cached or {}).get("ingested_signature"),
+    }
+    return facts, False
+
+
+def _collect_pulled(
+    result: CollectResult,
+    store: Store,
+    sources: dict[str, Any],
+    roots: list[Path],
+    since: datetime,
+    until: datetime,
+    *,
+    recursive: bool,
+    match_mode: str,
+    min_turns: int,
+    min_tools: int,
+    refresh: bool,
+) -> None:
+    """Add teammates' transcripts from ``<store>/pulled/`` to the selection.
+
+    A pulled transcript is a byte-identical copy of what the teammate had on
+    disk, so it goes through the same filters as a local one. Two things differ:
+    it carries an author, and it is already inside the store, so the ingest step
+    must not copy it into ``raw/`` a second time.
+    """
+    from .pull import pulled_sessions  # imported here: pull is PM-side only
+
+    for row in pulled_sessions(store):
+        if not row.get("present"):
+            continue  # listed in the pull state but not (yet) on disk
+        path = Path(str(row.get("path")))
+        result.scanned_files += 1
+        try:
+            signature = stat_signature(path)
+        except OSError:
+            continue
+
+        facts, reused = _facts_for(path, sources, signature, refresh)
+        if reused:
+            result.reused_files += 1
+        else:
+            result.parsed_files += 1
+
+        if facts.tool_generated:
+            result.skipped_internal += 1
+            continue
+        matched = match_root(facts, roots, recursive, match_mode)
+        if matched is None:
+            result.skipped_out_of_scope += 1
+            continue
+        if not overlaps_window(facts, since, until):
+            result.skipped_out_of_window += 1
+            continue
+        if facts.user_turns < min_turns or sum(facts.tool_uses.values()) < min_tools:
+            result.skipped_empty += 1
+            continue
+
+        root, reason = matched
+        result.selected.append(
+            Selection(
+                facts=facts,
+                matched_root=root,
+                match_reason=reason,
+                reused_from_index=reused,
+                stored_path=str(path),
+                window_days=active_days_in(facts, since, until),
+                author=str(row.get("author") or ""),
+                pulled=True,
+            )
+        )
+
+
 def collect(
     roots: list[Path],
     since: datetime,
@@ -197,6 +314,7 @@ def collect(
     min_tools: int = 1,
     dry_run: bool = False,
     refresh: bool = False,
+    include_pulled: bool = False,
     projects_dir: Path | None = None,
     run_id: str | None = None,
     chooser: Callable[[list[Selection]], list[Selection]] | None = None,
@@ -220,31 +338,11 @@ def collect(
         except OSError:
             continue
 
-        cached = sources.get(key)
-        unchanged = (
-            not refresh
-            and isinstance(cached, dict)
-            and cached.get("signature") == signature
-            and isinstance(cached.get("facts"), dict)
-        )
-
+        facts, unchanged = _facts_for(path, sources, signature, refresh)
         if unchanged:
-            facts = SessionFacts(**{
-                field_name: cached["facts"][field_name]
-                for field_name in SessionFacts.__dataclass_fields__
-                if field_name in cached["facts"]
-            })
             result.reused_files += 1
         else:
-            facts = scan_transcript(path)
             result.parsed_files += 1
-            sources[key] = {
-                "signature": signature,
-                "facts": facts.to_dict(),
-                "stored_path": (cached or {}).get("stored_path"),
-                "ingested_at": (cached or {}).get("ingested_at"),
-                "ingested_signature": (cached or {}).get("ingested_signature"),
-            }
 
         if facts.tool_generated or any(
             _contains(store.root, cwd, True) for cwd in facts.cwds
@@ -279,6 +377,21 @@ def collect(
             )
         )
 
+    if include_pulled:
+        _collect_pulled(
+            result,
+            store,
+            sources,
+            roots,
+            since,
+            until,
+            recursive=recursive,
+            match_mode=match_mode,
+            min_turns=min_turns,
+            min_tools=min_tools,
+            refresh=refresh,
+        )
+
     result.selected.sort(key=lambda s: s.last_active, reverse=True)
 
     # Let the caller narrow the selection before anything is written.
@@ -292,6 +405,9 @@ def collect(
 
     store.ensure()
     for selection in result.selected:
+        if selection.pulled:
+            # Already inside the store, and not ours to re-file under raw/.
+            continue
         record = sources.setdefault(selection.facts.source_path, {})
         signature = record.get("signature")
         already_ingested = (

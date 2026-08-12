@@ -490,6 +490,11 @@ def run_pipeline(
         "window": window,
         "roots": roots,
         "sessions": [s.facts.session_id for s, _ in payloads],
+        # Who each session belongs to, so the renderer can group by person.
+        # Empty means this machine; a name means it was pulled from a teammate.
+        "session_authors": {
+            s.facts.session_id: getattr(s, "author", "") for s, _ in payloads
+        },
         "repos": [
             {"name": r["name"], "branch": r["branch"], "commits": len(r["commits"])}
             for r in repos.values()

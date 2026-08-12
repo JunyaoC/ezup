@@ -4,20 +4,27 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
-from . import picker
-from .collect import CollectResult, collect, normalize_roots
+from . import hook_entry, hooks, picker, share
+from .collect import CollectResult, Selection, collect, normalize_roots
+from .config import PullView, load_config, transport_for
 from .console import Console
 from .pipeline import STAGES as pipeline_stages_const, run_pipeline
 
 
 def pipeline_stages() -> list[str]:
     return list(pipeline_stages_const)
+from .publish import PublishState, publish as publish_session
+from .pull import pull as pull_sessions, pulled_sessions
 from .store import Store, default_store
+from .transcripts import CLAUDE_PROJECTS_DIR, SessionFacts, scan_transcript
+from .transport import HttpTransport, SessionMeta, TransportError
 from .window import end_of_day, isoformat, since_to_datetime
 
 
@@ -66,61 +73,90 @@ def parse_selection(text: str, count: int) -> list[int] | None:
     return chosen
 
 
-def _session_row(index: int | None, selection) -> str:
+def _columns(selections: list) -> tuple[bool, bool]:
+    """Which optional columns this list needs: (synced, author).
+
+    Decided per table rather than per row so the columns line up even when only
+    some sessions carry an author or a sync state.
+    """
+    return (
+        any(getattr(s, "synced", "") for s in selections),
+        any(getattr(s, "author", "") for s in selections),
+    )
+
+
+def _session_row(
+    index: int | None, selection, columns: tuple[bool, bool] = (False, False)
+) -> str:
     facts = selection.facts
     tools = sum(facts.tool_uses.values())
+    show_sync, show_author = columns
     prefix = f"{index:>3}. " if index is not None else ""
     days = f" +{len(selection.window_days) - 1}d" if len(selection.window_days) > 1 else ""
     return (
         f"{prefix}"
         f"{selection.last_active + days:<17}"
-        f"{selection.match_reason:<7}"
-        f"{facts.user_turns:>6}  "
+        + (f"{_shorten(getattr(selection, 'synced', '') or '-', 11)}" if show_sync else "")
+        + f"{selection.match_reason:<7}"
+        + (f"{_shorten(getattr(selection, 'author', '') or 'me', 13)}" if show_author else "")
+        + f"{facts.user_turns:>6}  "
         f"{tools:>6}  "
         f"{_shorten(selection.display_dir, 30)}  "
         f"{_shorten(facts.title or facts.session_id[:8], 44)}"
     )
 
 
-def _table_header(numbered: bool) -> str:
+def _table_header(numbered: bool, columns: tuple[bool, bool] = (False, False)) -> str:
+    show_sync, show_author = columns
     prefix = "  #  " if numbered else ""
     return (
-        f"{prefix}{'ACTIVE':<17}{'WHY':<7}"
-        f"{'TURNS':>6}  {'TOOLS':>6}  {'DIRECTORY':<30}  {'TITLE'}"
+        f"{prefix}{'ACTIVE':<17}"
+        + (f"{'SYNCED':<11}" if show_sync else "")
+        + f"{'WHY':<7}"
+        + (f"{'WHO':<13}" if show_author else "")
+        + f"{'TURNS':>6}  {'TOOLS':>6}  {'DIRECTORY':<30}  {'TITLE'}"
     )
 
 
-def interactive_chooser(selections: list) -> list:
+def interactive_chooser(
+    selections: list, verb: str = "collect", default_all: bool = True
+) -> list:
     """Let the user pick which sessions to keep.
 
     Uses the full-screen checkbox picker on a terminal, and a numbered prompt
-    when stdin or stdout is redirected.
+    when stdin or stdout is redirected. ``default_all`` is what a bare Enter
+    means at the numbered prompt -- false for anything that leaves the machine,
+    where the safe reading of "Enter" is "none of them".
     """
     if not selections:
         return []
     if sys.stdin.isatty() and sys.stdout.isatty():
-        chosen = picker.pick(selections)
+        chosen = picker.pick(selections, verb)
         if chosen is picker.ABORTED:
-            print("cancelled; nothing collected", file=sys.stderr)
+            print(f"cancelled; nothing {verb}ed", file=sys.stderr)
             raise SystemExit(1)
         return chosen
-    return numbered_chooser(selections)
+    return numbered_chooser(selections, default_all=default_all)
 
 
-def numbered_chooser(selections: list) -> list:
-    print(_table_header(numbered=True))
+def numbered_chooser(selections: list, default_all: bool = True) -> list:
+    columns = _columns(selections)
+    print(_table_header(numbered=True, columns=columns))
     for position, selection in enumerate(selections, start=1):
-        print(_session_row(position, selection))
+        print(_session_row(position, selection, columns))
     print()
 
+    fallback = "Enter=all" if default_all else "Enter=none"
     while True:
         try:
             answer = input(
                 f"select 1-{len(selections)} (e.g. 1,3,5-8) "
-                f"[a=all, n=none, Enter=all]: "
+                f"[a=all, n=none, {fallback}]: "
             )
         except (EOFError, KeyboardInterrupt):
             print()
+            return []
+        if not answer.strip() and not default_all:
             return []
         chosen = parse_selection(answer, len(selections))
         if chosen is None:
@@ -141,10 +177,11 @@ def _print_result(
     if not result.selected:
         print("no sessions matched")
     else:
-        print(_table_header(numbered=False))
+        columns = _columns(result.selected)
+        print(_table_header(numbered=False, columns=columns))
         shown = result.selected[:limit] if limit > 0 else result.selected
         for selection in shown:
-            print(_session_row(None, selection))
+            print(_session_row(None, selection, columns))
         hidden = len(result.selected) - len(shown)
         if hidden > 0:
             print(f"... {hidden} more (use --limit 0 to show all, or --json)")
@@ -201,6 +238,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
         min_tools=args.min_tools,
         dry_run=args.dry_run,
         refresh=args.refresh,
+        include_pulled=args.include_pulled,
         chooser=interactive_chooser if args.interactive else None,
     )
 
@@ -262,6 +300,14 @@ def cmd_status(args: argparse.Namespace) -> int:
     ingested = [s for s in sources.values() if s.get("stored_path")]
     runs = sorted(store.runs_dir.glob("*.json")) if store.runs_dir.is_dir() else []
 
+    config = load_config(store, os.getcwd())
+    opted_in = [
+        path
+        for path in sorted(share.sessions_dir(store).glob("*.share"))
+        if path.read_text(encoding="utf-8").strip() == "on"
+    ] if share.sessions_dir(store).is_dir() else []
+    published = sorted((store.root / "publish").glob("*.json"))
+
     payload = {
         "store": str(store.root),
         "exists": store.root.is_dir(),
@@ -270,6 +316,14 @@ def cmd_status(args: argparse.Namespace) -> int:
         "transcripts_ingested": len(ingested),
         "runs": len(runs),
         "latest_run": runs[-1].stem if runs else None,
+        "hook_installed": hooks.status()["installed"],
+        "team_store": config.store_url or None,
+        # Never the token itself, only whether one is present and from where.
+        "team_token": ("set" if config.token else "missing") if config.needs_token else "n/a",
+        "author": config.author,
+        "sessions_sharing": len(opted_in),
+        "sessions_published": len(published),
+        "sessions_pulled": len(pulled_sessions(store)),
     }
     if args.json:
         json.dump(payload, sys.stdout, indent=2)
@@ -277,6 +331,667 @@ def cmd_status(args: argparse.Namespace) -> int:
     else:
         for key, value in payload.items():
             print(f"{key:<22}{value}")
+    return 0
+
+
+# -- sharing plumbing ---------------------------------------------------------
+
+
+def _store_for(args: argparse.Namespace) -> Store:
+    return Store(Path(args.store).expanduser() if args.store else default_store())
+
+
+def _human(count: int) -> str:
+    if count < 1024:
+        return f"{count} B"
+    if count < 1024 * 1024:
+        return f"{count / 1024:.0f} KB"
+    return f"{count / (1024 * 1024):.1f} MB"
+
+
+def _emit(payload: dict[str, Any], as_json: bool, lines: list[str]) -> None:
+    if as_json:
+        json.dump(payload, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return
+    for line in lines:
+        print(line)
+
+
+def _current_session(args: argparse.Namespace) -> str | None:
+    """The session to act on: the one named, else the one we are running in."""
+    named = getattr(args, "session", None)
+    return str(named) if named else share.current_session_id()
+
+
+def _find_transcript(session_id: str, store: Store) -> Path | None:
+    """Locate a session's transcript: live first, then the store's copy.
+
+    ``~/.claude/projects`` is authoritative because it is the file Claude Code
+    is still appending to; the store copy only helps for a session whose
+    original has since been deleted.
+    """
+    matches = sorted(CLAUDE_PROJECTS_DIR.glob(f"*/{session_id}.jsonl"))
+    if matches:
+        return matches[0]
+    copies = sorted(store.raw_dir.glob(f"*/{session_id}.jsonl"))
+    if copies:
+        return copies[0]
+    pulled = sorted((store.root / "pulled").glob(f"*/{session_id}.jsonl"))
+    return pulled[0] if pulled else None
+
+
+def _facts(path: Path) -> SessionFacts:
+    try:
+        return scan_transcript(path)
+    except OSError:
+        return SessionFacts(
+            session_id=path.stem, source_path=str(path), project_slug=path.parent.name
+        )
+
+
+def _meta_for(session_id: str, facts: SessionFacts, author: str, cwd: str) -> SessionMeta:
+    return SessionMeta(
+        session=session_id,
+        author=author,
+        project=share.project_name(facts.cwd or cwd),
+        branch=facts.git_branches[0] if facts.git_branches else "",
+        cwd=facts.cwd or cwd,
+        first_ts=facts.first_timestamp or "",
+        last_ts=facts.last_timestamp or "",
+        title=facts.title or "",
+        level="raw",
+    )
+
+
+def _sync_refusal(store: Store, session_id: str, cwd: str) -> str:
+    """Why `sync` may not share this session, or "" when it may.
+
+    `sync` is itself a consent step, so the states that mean "nobody has decided
+    yet" -- a repo that says ``ask``, or no policy at all -- are exactly what it
+    exists to offer. A decision that *was* already made is a different thing: an
+    explicit `ezcl share off`, a repo-level ``never``, or a resolution that
+    failed outright must not be undone by one keystroke in a picker.
+    """
+    decision = share.resolve(session_id, cwd, store)
+    if decision.sharing:
+        return ""
+    if decision.source in ("session", "error"):
+        return decision.reason
+    policy = share.effective_policy(cwd)
+    return decision.reason if policy is not None and policy.mode == "never" else ""
+
+
+def _sync_label(store: Store, selection: Selection) -> str:
+    """The SYNCED column: how much of this transcript has already left."""
+    path = Path(selection.stored_path or selection.facts.source_path)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    state = PublishState.load(store, selection.facts.session_id)
+    if state.offset <= 0:
+        return "never"
+    if state.offset >= size:
+        return "up to date"
+    return f"+{_human(size - state.offset)}"
+
+
+# -- hook ---------------------------------------------------------------------
+
+
+def cmd_hook(args: argparse.Namespace) -> int:
+    try:
+        if args.action == "install":
+            info = hooks.install(args.settings)
+        elif args.action == "uninstall":
+            info = hooks.uninstall(args.settings)
+        else:
+            info = hooks.status(args.settings)
+    except RuntimeError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+    lines = [f"{key:<22}{value}" for key, value in info.items()]
+    if args.action == "install":
+        # Say this every time: an installer that silently starts uploading is
+        # exactly the thing this feature is built not to be.
+        lines.append("")
+        lines.append(
+            "installed, and sharing is still OFF. Nothing leaves this machine "
+            "until you run `ezcl share on`."
+        )
+    _emit(info, args.json, lines)
+    return 0
+
+
+# -- share --------------------------------------------------------------------
+
+
+def _share_status(store: Store, session_id: str | None, cwd: str, as_json: bool) -> int:
+    decision = share.resolve(session_id, cwd, store)
+    config = load_config(store, cwd)
+    state = PublishState.load(store, session_id) if session_id else PublishState("")
+    payload = {
+        "session": session_id,
+        "sharing": decision.sharing,
+        "state": decision.state,
+        "source": decision.source,
+        "reason": decision.reason,
+        "repo": config.repo,
+        "store": config.store_url,
+        "token": "set" if config.token else ("missing" if config.needs_token else "n/a"),
+        "author": config.author,
+        "published_bytes": state.offset,
+        "last_published": state.last_published,
+    }
+    lines = [
+        f"session   {session_id or 'unknown (not inside a Claude Code session)'}",
+        f"sharing   {decision.state}",
+        f"why       {decision.reason}",
+        *config.describe(),
+        f"published {_human(state.offset)}"
+        + (f" (last {state.last_published})" if state.last_published else ""),
+    ]
+    _emit(payload, as_json, lines)
+    return 0
+
+
+def _ack_policy(
+    store: Store, session_id: str | None, cwd: str, as_json: bool, say: Any
+) -> int:
+    """Accept the committed ``always`` policy governing ``cwd`` -- and only that.
+
+    What is acknowledged is a specific policy document, quoted back in full
+    before it is accepted, not "this directory". Anything else -- no policy, a
+    policy that is not ``always`` -- is refused out loud, because an ack of a
+    repo that currently asks for nothing is a blank cheque for whatever it asks
+    for after the next `git pull`.
+    """
+    policy = share.effective_policy(cwd)
+    if policy is None:
+        print(
+            f"error: no .ez/config.json at or above {cwd} declares a \"share\" "
+            f"policy, so there is nothing to acknowledge. `share ack` accepts a "
+            f"repo's committed policy; to share just this session run "
+            f"`ezcl share on`.",
+            file=sys.stderr,
+        )
+        return 2
+    if policy.mode != "always":
+        print(
+            f"error: {policy.where} says \"share\": \"{policy.mode}\", which "
+            f"needs no acknowledgement"
+            + (
+                " -- sessions under it are never shared."
+                if policy.mode == "never"
+                else " -- run `ezcl share on` per session instead."
+            ),
+            file=sys.stderr,
+        )
+        return 2
+
+    # Quote the policy before accepting it: consent to a hash nobody read is
+    # not consent. `store` is called out by name because it is the field that
+    # decides where the bytes actually land.
+    say(f"policy   {policy.where}")
+    say(f"  share  always — every session under {policy.repo} is uploaded")
+    say(f"  store  {policy.store or 'not set here (falls back to this machine)'}")
+    for key, value in sorted(policy.config.items()):
+        if key not in ("share", "store"):
+            say(f"  {key:<6} {value}")
+
+    try:
+        path = share.acknowledge(policy.repo, store)
+    except share.ShareRefused as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 3
+    say(
+        f"acknowledged on this machine ({path}). This accepts the file exactly "
+        f"as printed above: if any of it changes, sharing reverts to off until "
+        f"you run `ezcl share ack` again."
+    )
+    return _share_status(store, session_id, cwd, as_json)
+
+
+def _watermark_session(store: Store, session_id: str) -> int | None:
+    """Record that only bytes written *after* now may ever be published.
+
+    A fresh :class:`PublishState` starts at offset 0, so the first upload after
+    an opt-in would carry the whole transcript -- including the 40 minutes of
+    customer data the developer debugged before deciding to share. Seeding
+    ``start_offset`` with the file's current size makes "nothing from before now
+    is sent" a fact rather than a claim.
+
+    Returns the watermark, or None when the session has already published (the
+    resume offset already covers it) or has no transcript on disk yet.
+    """
+    state = PublishState.load(store, session_id)
+    if state.published:
+        return None
+    path = _find_transcript(session_id, store)
+    if path is None:
+        return None
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+    state.start_offset = size
+    state.save(store)
+    return size
+
+
+def cmd_share(args: argparse.Namespace) -> int:
+    store = _store_for(args)
+    cwd = os.getcwd()
+    session_id = _current_session(args)
+
+    def say(message: str) -> None:
+        # --json must stay machine-readable, so the prose goes to stderr there
+        # rather than being dropped: a person watching still sees what changed.
+        print(message, file=sys.stderr if args.json else sys.stdout)
+
+    if args.action == "status":
+        return _share_status(store, session_id, cwd, args.json)
+
+    if args.action == "ack":
+        return _ack_policy(store, session_id, cwd, args.json, say)
+
+    if session_id is None:
+        print(
+            f"error: no session id; run this inside a Claude Code session or "
+            f"pass --session (${share.SESSION_ENV} is unset)",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.action == "clear":
+        cleared = share.clear_session(store, session_id)
+        say(
+            f"{'cleared' if cleared else 'nothing to clear for'} {session_id}; "
+            f"the repo policy applies again"
+        )
+        return _share_status(store, session_id, cwd, args.json)
+
+    try:
+        share.set_session(session_id, args.action == "on", store, cwd=cwd)
+    except share.ShareRefused as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 3
+
+    if args.action == "on":
+        config = load_config(store, cwd)
+        watermark = _watermark_session(store, session_id)
+        say(
+            f"sharing ON for session {session_id}: from now on, the full "
+            f"transcript of this session is uploaded to "
+            f"{config.store_url or 'the store (not configured yet)'}, including "
+            f"everything you type and everything tools print. Run "
+            f"`ezcl share off` to stop."
+        )
+        if watermark:
+            say(
+                f"the {_human(watermark)} of this session recorded before now "
+                f"stays on this machine: publishing starts at byte {watermark}. "
+                f"Run `ezcl sync` if you do want the earlier part shared too."
+            )
+        elif PublishState.load(store, session_id).published:
+            say(
+                "this session has published before, so sharing resumes where it "
+                "left off; `ezcl unpublish` removes what is already up there."
+            )
+        else:
+            say("nothing was recorded before now, so nothing earlier exists to send.")
+    else:
+        say(
+            f"sharing OFF for session {session_id}: no further bytes leave this "
+            f"machine. Anything already published stays until you run "
+            f"`ezcl unpublish --session {session_id}`."
+        )
+    return _share_status(store, session_id, cwd, args.json)
+
+
+# -- publish ------------------------------------------------------------------
+
+
+def cmd_publish(args: argparse.Namespace) -> int:
+    store = _store_for(args)
+    session_id = _current_session(args)
+    if session_id is None:
+        print(
+            f"error: no session id; pass --session or run inside a Claude Code "
+            f"session (${share.SESSION_ENV} is unset)",
+            file=sys.stderr,
+        )
+        return 2
+
+    path = Path(args.transcript).expanduser() if args.transcript else _find_transcript(
+        session_id, store
+    )
+    if path is None or not path.is_file():
+        print(f"error: no transcript found for session {session_id}", file=sys.stderr)
+        return 2
+
+    facts = _facts(path)
+    # The hook runs this from the store directory, so the process cwd says
+    # nothing about which repo the work happened in. The transcript does.
+    cwd = facts.cwd or os.getcwd()
+
+    decision = share.resolve(session_id, cwd, store)
+    if not decision.sharing and not args.dry_run:
+        print(f"not sharing: {decision.reason}", file=sys.stderr)
+        return 3
+
+    config = load_config(store, cwd)
+    try:
+        transport = transport_for(config)
+    except TransportError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+
+    try:
+        report = publish_session(
+            session_id,
+            path,
+            transport,
+            store,
+            _meta_for(session_id, facts, config.author, cwd),
+            dry_run=args.dry_run,
+        )
+    except (FileNotFoundError, TransportError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        json.dump(report.to_dict(), sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    else:
+        if not decision.sharing:
+            print(f"sharing is off ({decision.source}); this is a preview only")
+        print(report.describe())
+    return 0
+
+
+def cmd_unpublish(args: argparse.Namespace) -> int:
+    store = _store_for(args)
+    session_id = args.session
+    path = _find_transcript(session_id, store)
+    cwd = (_facts(path).cwd if path else None) or os.getcwd()
+    config = load_config(store, cwd)
+    try:
+        transport = transport_for(config)
+    except TransportError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+
+    if not args.yes:
+        if not sys.stdin.isatty():
+            print("error: refusing to delete without --yes", file=sys.stderr)
+            return 2
+        answer = input(
+            f"delete every published byte of session {session_id} from "
+            f"{transport.describe()}? [y/N] "
+        )
+        if answer.strip().lower() not in ("y", "yes"):
+            print("cancelled")
+            return 1
+
+    try:
+        transport.delete_session(session_id)
+    except TransportError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+    # Forget the offsets too, or the next publish would resume mid-file into a
+    # session that no longer exists on the server.
+    PublishState.path_for(store, session_id).unlink(missing_ok=True)
+    # And stop the hook from immediately re-uploading what was just deleted.
+    share.set_session(session_id, False, store, cwd=cwd)
+    print(
+        f"deleted session {session_id} from {transport.describe()}; sharing for "
+        f"it is now off"
+    )
+    return 0
+
+
+# -- sync ---------------------------------------------------------------------
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    store = _store_for(args)
+    now = datetime.now(timezone.utc)
+    try:
+        since = since_to_datetime(args.window, now)
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+
+    result = collect(
+        normalize_roots(args.directories),
+        since,
+        now,
+        store,
+        min_turns=args.min_turns,
+        min_tools=args.min_tools,
+        dry_run=True,  # sync shares transcripts; it never ingests or journals
+    )
+    if not result.selected:
+        print(f"no sessions since {isoformat(since)[:16]}")
+        return 0
+
+    blocked: dict[str, str] = {}
+    for selection in result.selected:
+        session_id = selection.facts.session_id
+        refusal = _sync_refusal(store, session_id, selection.facts.cwd or ".")
+        if refusal:
+            blocked[session_id] = refusal
+        selection.synced = "BLOCKED" if refusal else _sync_label(store, selection)
+
+    print(f"window   {isoformat(since)[:16]} .. now")
+    print(f"store    {store.root}")
+    print(
+        "tick the sessions whose full transcript may leave this machine; "
+        "nothing is ticked to begin with"
+    )
+    if blocked:
+        # Listed before the picker, not just marked in it: [a] ticks every row
+        # in one keystroke, so the user has to be able to see what that keystroke
+        # cannot include.
+        print(
+            f"{len(blocked)} session(s) are BLOCKED and will not be shared even "
+            f"if ticked:"
+        )
+        for session_id, refusal in blocked.items():
+            print(f"  {session_id[:8]}  {refusal}")
+    print()
+    chosen = interactive_chooser(result.selected, verb="share", default_all=False)
+    if not chosen:
+        print("nothing shared")
+        return 0
+
+    failures = 0
+    transports: dict[tuple[str, str, str], Any] = {}
+    for selection in chosen:
+        session_id = selection.facts.session_id
+        cwd = selection.facts.cwd or os.getcwd()
+        # Re-checked here rather than trusting the label: between drawing the
+        # table and confirming it, the only thing that must be true is that this
+        # session is still allowed to leave.
+        refusal = _sync_refusal(store, session_id, cwd)
+        if refusal:
+            print(f"{session_id[:8]}  refused: {refusal}")
+            failures += 1
+            continue
+
+        config = load_config(store, cwd)
+        # Each session resolves its own destination -- two repos in one window
+        # can publish to two different stores, or with two different tokens.
+        key = (config.store_url, config.token, config.author)
+        try:
+            if key not in transports:
+                transports[key] = transport_for(config)
+            transport = transports[key]
+        except TransportError as error:
+            print(f"{session_id[:8]}  error: {error}", file=sys.stderr)
+            failures += 1
+            continue
+
+        path = Path(selection.stored_path or selection.facts.source_path)
+        try:
+            report = publish_session(
+                session_id,
+                path,
+                transport,
+                store,
+                _meta_for(session_id, selection.facts, config.author, cwd),
+                dry_run=args.dry_run,
+            )
+        except (FileNotFoundError, TransportError) as error:
+            print(f"{session_id[:8]}  error: {error}", file=sys.stderr)
+            failures += 1
+            continue
+
+        verb = "would send" if args.dry_run else "sent"
+        print(
+            f"{session_id[:8]}  {verb} {_human(report.bytes_sent)} in "
+            f"{len(report.chunks)} chunk(s) to {report.destination}"
+        )
+        # The scan is deliberately trigger-happy (see publish.secret_scan), so
+        # a session's worth of findings would bury the summary. `ezcl publish
+        # --dry-run --session ...` prints all of them.
+        for warning in report.warnings[:3]:
+            print(f"          WARNING possible secret: {warning}")
+        if len(report.warnings) > 3:
+            print(
+                f"          ... {len(report.warnings) - 3} more possible secrets; "
+                f"see `ezcl publish --dry-run --session {session_id}`"
+            )
+        if args.enable and not args.dry_run:
+            try:
+                share.set_session(session_id, True, store, cwd=cwd)
+            except share.ShareRefused as error:
+                print(f"          {error}", file=sys.stderr)
+
+    if args.enable and not args.dry_run:
+        print("these sessions stay shared: the hook will keep them current")
+    return 1 if failures else 0
+
+
+# -- pull ---------------------------------------------------------------------
+
+
+def cmd_token(args: argparse.Namespace) -> int:
+    """Reader-token management: a dev grants an operator read access."""
+    store = _store_for(args)
+    config = load_config(store, os.getcwd())
+    try:
+        transport = transport_for(config)
+    except TransportError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    if not isinstance(transport, HttpTransport):
+        print(
+            "error: reader tokens need a worker store; this store is a local "
+            "directory, which has no auth to grant",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        if args.token_command == "mint":
+            minted = transport.mint_reader(args.name)
+            token = str(minted.get("token") or "")
+            _emit(
+                minted,
+                args.json,
+                [
+                    f"reader token for {args.name!r} — shown once, never again:",
+                    "",
+                    f"  {token}",
+                    "",
+                    f"grants: {minted.get('grants', 'read-only access to your sessions')}",
+                    "the operator uses it as EZUPDATE_TOKEN with the same store URL",
+                    f"revoke any time: ezcl token revoke {minted.get('id', '?')}",
+                ],
+            )
+            return 0
+        if args.token_command == "list":
+            rows = transport.list_readers()
+            lines = [f"{len(rows)} reader token(s) minted by this device"]
+            for row in rows:
+                state = "revoked" if row.get("revoked_at") else "active"
+                lines.append(
+                    f"  {row.get('id','?'):<38}{state:<9}"
+                    f"{row.get('name','')}  ({str(row.get('created_at',''))[:10]})"
+                )
+            _emit({"tokens": rows}, args.json, lines)
+            return 0
+        # revoke
+        gone = transport.revoke_reader(args.id)
+        _emit(gone, args.json, [f"revoked {args.id}; that token stops working now"])
+        return 0
+    except TransportError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+
+def cmd_pull(args: argparse.Namespace) -> int:
+    store = _store_for(args)
+    config = load_config(store, os.getcwd())
+    try:
+        transport = transport_for(config)
+    except TransportError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+
+    since: str | None = None
+    if args.since:
+        try:
+            since = isoformat(since_to_datetime(args.since, datetime.now(timezone.utc)))
+        except ValueError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 2
+
+    report = pull_sessions(PullView(transport), store, since=since, authors=args.author)
+    payload = {
+        "store": transport.describe(),
+        "sessions_new": report.sessions_new,
+        "sessions_updated": report.sessions_updated,
+        "chunks": report.chunks,
+        "bytes": report.bytes,
+        "errors": report.errors,
+    }
+    lines = [
+        f"from     {transport.describe()}",
+        f"new      {report.sessions_new} sessions",
+        f"updated  {report.sessions_updated} sessions",
+        f"fetched  {report.chunks} chunks, {_human(report.bytes)}",
+        f"pulled   {store.root / 'pulled'}",
+    ]
+    lines += [f"ERROR    {problem}" for problem in report.errors]
+    if report.ok and (report.sessions_new or report.sessions_updated):
+        lines.append("run `ezcl collect --include-pulled -i` to journal them")
+    _emit(payload, args.json, lines)
+    return 0 if report.ok else 1
+
+
+# -- statusline ---------------------------------------------------------------
+
+
+def cmd_statusline(args: argparse.Namespace) -> int:
+    """Print the one-line indicator Claude Code shows while a session runs.
+
+    Delegates to the hook entry point so the `ezcl statusline` and
+    `python -m ezchangelog.hook_entry statusline` forms cannot drift apart.
+    """
+    try:
+        raw = sys.stdin.read() if not sys.stdin.isatty() else ""
+        payload = json.loads(raw) if raw.strip() else {}
+    except (OSError, ValueError, UnicodeDecodeError):
+        payload = {}
+    line = hook_entry.statusline(payload if isinstance(payload, dict) else {})
+    if line:
+        print(line)
     return 0
 
 
@@ -360,6 +1075,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=30,
         help="max rows to print (0 = all); does not affect what is stored",
     )
+    collect_parser.add_argument(
+        "--include-pulled",
+        action="store_true",
+        help="also consider teammates' sessions fetched by `ezcl pull`",
+    )
     collect_parser.add_argument("--json", action="store_true", help="emit the manifest as JSON")
     collect_parser.add_argument(
         "--no-journal",
@@ -379,6 +1099,145 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser = subparsers.add_parser("status", help="summarize the store and index")
     status_parser.add_argument("--json", action="store_true")
     status_parser.set_defaults(func=cmd_status)
+
+    hook_parser = subparsers.add_parser(
+        "hook",
+        help="wire ezupdate into ~/.claude/settings.json (installing shares nothing)",
+    )
+    hook_parser.add_argument(
+        "action",
+        choices=("install", "uninstall", "status"),
+        help="install adds the hook + status line; uninstall removes only ours",
+    )
+    hook_parser.add_argument(
+        "--settings", help="settings.json to edit (default ~/.claude/settings.json)"
+    )
+    hook_parser.add_argument("--json", action="store_true")
+    hook_parser.set_defaults(func=cmd_hook)
+
+    share_parser = subparsers.add_parser(
+        "share",
+        help="turn transcript sharing on or off for one session, and say why",
+    )
+    share_parser.add_argument(
+        "action",
+        choices=("on", "off", "status", "ack", "clear"),
+        help=(
+            "on/off set this session explicitly; status explains the current "
+            "decision; ack accepts a repo's committed \"always\" policy on this "
+            "machine; clear drops the session setting so the repo policy applies"
+        ),
+    )
+    share_parser.add_argument(
+        "--session",
+        help=f"session id; default the one this command runs in (${share.SESSION_ENV})",
+    )
+    share_parser.add_argument("--json", action="store_true")
+    share_parser.set_defaults(func=cmd_share)
+
+    publish_parser = subparsers.add_parser(
+        "publish",
+        help="upload whatever of a shared session's transcript is not up there yet",
+    )
+    publish_parser.add_argument(
+        "--session",
+        help=f"session id; default the one this command runs in (${share.SESSION_ENV})",
+    )
+    publish_parser.add_argument(
+        "--transcript",
+        help="transcript file to publish; default the session's own file",
+    )
+    publish_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print every byte range that would be sent, and send nothing",
+    )
+    publish_parser.add_argument("--json", action="store_true")
+    publish_parser.set_defaults(func=cmd_publish)
+
+    unpublish_parser = subparsers.add_parser(
+        "unpublish", help="delete a session from the store and stop sharing it"
+    )
+    unpublish_parser.add_argument("--session", required=True, help="session id to delete")
+    unpublish_parser.add_argument(
+        "-y", "--yes", action="store_true", help="do not ask for confirmation"
+    )
+    unpublish_parser.set_defaults(func=cmd_unpublish)
+
+    sync_parser = subparsers.add_parser(
+        "sync",
+        help="pick recent sessions and share their transcripts (nothing pre-ticked)",
+    )
+    sync_parser.add_argument(
+        "window",
+        nargs="?",
+        default="7d",
+        help="how far back to look: 7d, 24h, 2w, or a date; default 7d",
+    )
+    sync_parser.add_argument(
+        "directories",
+        nargs="*",
+        default=[],
+        help="restrict to sessions belonging to these directories",
+    )
+    sync_parser.add_argument(
+        "--min-turns", type=int, default=1, help="drop sessions with fewer user prompts"
+    )
+    sync_parser.add_argument(
+        "--min-tools", type=int, default=1, help="drop sessions with fewer tool calls"
+    )
+    sync_parser.add_argument(
+        "--enable",
+        action="store_true",
+        help="also turn sharing on for the picked sessions, so the hook keeps them current",
+    )
+    sync_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show what each pick would send, and send nothing",
+    )
+    sync_parser.set_defaults(func=cmd_sync)
+
+    pull_parser = subparsers.add_parser(
+        "pull", help="fetch teammates' shared transcripts into <store>/pulled/"
+    )
+    pull_parser.add_argument(
+        "--since",
+        help="re-list everything changed since this point (7d, 2w, or a date); "
+        "default resumes from the stored cursor",
+    )
+    pull_parser.add_argument(
+        "--author",
+        action="append",
+        help="only this author; repeat for several",
+    )
+    pull_parser.add_argument("--json", action="store_true")
+    pull_parser.set_defaults(func=cmd_pull)
+
+    statusline_parser = subparsers.add_parser(
+        "statusline",
+        help="read hook JSON on stdin and print the one-line sharing indicator",
+    )
+    statusline_parser.set_defaults(func=cmd_statusline)
+
+    token_parser = subparsers.add_parser(
+        "token",
+        help="mint, list or revoke read-only tokens for operators",
+    )
+    token_sub = token_parser.add_subparsers(dest="token_command", required=True)
+    mint = token_sub.add_parser(
+        "mint", help="mint a read-only token scoped to your sessions"
+    )
+    mint.add_argument("--name", required=True, help="who this token is for")
+    mint.add_argument("--json", action="store_true")
+    mint.set_defaults(func=cmd_token, token_command="mint")
+    listing = token_sub.add_parser("list", help="list tokens you have minted")
+    listing.add_argument("--json", action="store_true")
+    listing.set_defaults(func=cmd_token, token_command="list")
+    revoke = token_sub.add_parser("revoke", help="revoke a token you minted")
+    revoke.add_argument("id", help="token id from `ezcl token list`")
+    revoke.add_argument("--json", action="store_true")
+    revoke.set_defaults(func=cmd_token, token_command="revoke")
 
     return parser
 

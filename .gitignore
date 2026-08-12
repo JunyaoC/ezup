@@ -4,3 +4,20 @@ __pycache__/
 *.pyc
 .DS_Store
 uv.lock
+
+# Wrangler / Worker. .dev.vars holds real secrets (ADMIN_TOKEN) in local dev,
+# and .wrangler/ caches account state — neither may ever be committed.
+.dev.vars
+.dev.vars.*
+.wrangler/
+worker/.wrangler/
+worker/node_modules/
+worker/dist/
+node_modules/
+
+# Generated at deploy: carries the real account and D1 ids.
+worker/wrangler.local.jsonc
+
+# Local, machine-specific store config: holds the device token.
+config.local.json
+.ez/local.json

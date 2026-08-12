@@ -30,15 +30,36 @@ def _clip(text: str, room: int) -> str:
     return text[: room - 1] + "…"
 
 
-def _row_text(selection: Any, checked: bool, width: int) -> str:
+def _columns(selections: Sequence[Any]) -> tuple[bool, bool]:
+    """Which optional columns this run needs: (synced, author).
+
+    Decided once for the whole list rather than per row, so a column that is
+    empty on some sessions still keeps every row aligned.
+    """
+    return (
+        any(getattr(s, "synced", "") for s in selections),
+        any(getattr(s, "author", "") for s in selections),
+    )
+
+
+def _row_text(
+    selection: Any, checked: bool, width: int, columns: tuple[bool, bool] = (False, False)
+) -> str:
     facts = selection.facts
     tools = sum(facts.tool_uses.values())
     box = "[x]" if checked else "[ ]"
     days = f" +{len(selection.window_days) - 1}d" if len(selection.window_days) > 1 else ""
+    show_sync, show_author = columns
+    # `getattr` rather than attribute access: the picker stays usable with any
+    # row object, not only the Selection dataclass.
+    synced = str(getattr(selection, "synced", "") or "-")
+    who = str(getattr(selection, "author", "") or "me")
     prefix = (
         f"{box} {selection.last_active + days:<17}"
-        f"{selection.match_reason:<7}"
-        f"{facts.user_turns:>5}t {tools:>5}x  "
+        + (f"{_clip(synced, 11)}" if show_sync else "")
+        + f"{selection.match_reason:<7}"
+        + (f"{_clip(who, 13)}" if show_author else "")
+        + f"{facts.user_turns:>5}t {tools:>5}x  "
     )
     # Split the leftover width between the directory and the title.
     room = max(0, width - len(prefix) - 3)
@@ -56,6 +77,8 @@ def _draw(
     cursor: int,
     top: int,
     body_height: int,
+    columns: tuple[bool, bool] = (False, False),
+    verb: str = "collect",
 ) -> None:
     height, width = screen.getmaxyx()
     screen.erase()
@@ -63,7 +86,7 @@ def _draw(
     count = sum(checked)
     header = (
         f" {len(selections)} sessions   {count} picked   "
-        f"[space] toggle  [a] all  [n] none  [enter] collect  [q] cancel"
+        f"[space] toggle  [a] all  [n] none  [enter] {verb}  [q] cancel"
     )
     screen.addnstr(0, 0, header.ljust(width - 1), width - 1, curses.A_REVERSE)
 
@@ -71,7 +94,7 @@ def _draw(
         index = top + offset
         if index >= len(selections):
             break
-        text = _row_text(selections[index], checked[index], width)
+        text = _row_text(selections[index], checked[index], width, columns)
         attribute = curses.A_BOLD if index == cursor else curses.A_NORMAL
         screen.addnstr(offset + 1, 0, text.ljust(width - 1), width - 1, attribute)
         if index == cursor:
@@ -83,13 +106,18 @@ def _draw(
     screen.refresh()
 
 
-def _run(screen: "curses._CursesWindow", selections: Sequence[Any]) -> list[int] | object:
+def _run(
+    screen: "curses._CursesWindow", selections: Sequence[Any], verb: str = "collect"
+) -> list[int] | object:
     try:
         curses.curs_set(0)
     except curses.error:
         pass
     screen.keypad(True)
 
+    columns = _columns(selections)
+    # Nothing is ticked to begin with: the picker is the consent step, so
+    # confirming without touching anything must be a no-op.
     checked = [False] * len(selections)
     cursor = 0
     top = 0
@@ -105,7 +133,7 @@ def _run(screen: "curses._CursesWindow", selections: Sequence[Any]) -> list[int]
             top = cursor - body_height + 1
         top = max(0, min(top, max(0, len(selections) - body_height)))
 
-        _draw(screen, selections, checked, cursor, top, body_height)
+        _draw(screen, selections, checked, cursor, top, body_height, columns, verb)
 
         try:
             key = screen.getch()
@@ -139,11 +167,15 @@ def _run(screen: "curses._CursesWindow", selections: Sequence[Any]) -> list[int]
             continue
 
 
-def pick(selections: Sequence[Any]) -> list[Any] | object:
-    """Run the picker. Returns the chosen selections, or ABORTED if cancelled."""
+def pick(selections: Sequence[Any], verb: str = "collect") -> list[Any] | object:
+    """Run the picker. Returns the chosen selections, or ABORTED if cancelled.
+
+    ``verb`` names what Enter will do, because the same picker now confirms two
+    very different actions: collecting locally, and sharing off the machine.
+    """
     if not selections:
         return []
-    chosen = curses.wrapper(_run, selections)
+    chosen = curses.wrapper(_run, selections, verb)
     if chosen is ABORTED:
         return ABORTED
     return [selections[index] for index in chosen]

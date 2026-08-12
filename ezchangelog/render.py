@@ -4,12 +4,44 @@ from __future__ import annotations
 
 import html
 import json
+from collections import Counter
 from typing import Any
 
 SECTIONS = [
     ("delivered", "Delivered"),
     ("decisions", "Decisions"),
 ]
+
+# Shown for work this machine recorded. A journal that mixes several people's
+# sessions needs a name for "not a teammate", and "me" reads correctly for the
+# person running the tool -- which is who reads their own journal.
+SELF = "me"
+
+
+def _authors(entries: list[dict[str, Any]], meta: dict[str, Any]) -> list[dict[str, Any]]:
+    """Copies of ``entries`` with ``author`` filled in from whatever is known.
+
+    An entry may carry its own author; otherwise it inherits from the sessions
+    it cites (``meta["session_authors"]``, written by the pipeline), which is
+    the only place the pulled/local distinction survives compose. Entries are
+    copied rather than mutated: rendering must not edit the journal it renders.
+    """
+    session_authors = meta.get("session_authors") or {}
+    fallback = str(meta.get("author") or SELF)
+    out: list[dict[str, Any]] = []
+    for entry in entries:
+        author = str(entry.get("author") or "").strip()
+        if not author and isinstance(session_authors, dict):
+            names = [
+                str(session_authors[s])
+                for s in entry.get("sessions") or []
+                if session_authors.get(s)
+            ]
+            # One entry can merge two people's sessions; name whoever
+            # contributed most of them rather than inventing a joint author.
+            author = Counter(names).most_common(1)[0][0] if names else ""
+        out.append({**entry, "author": author or fallback})
+    return out
 
 
 def _as_lines(value: Any) -> list[str]:
@@ -48,7 +80,8 @@ def _time_of(stamp: str) -> str:
 
 
 def render_markdown(composed: dict[str, Any], meta: dict[str, Any]) -> str:
-    entries = composed.get("entries") or []
+    entries = _authors(composed.get("entries") or [], meta)
+    people = {entry["author"] for entry in entries}
     window = meta.get("window", {})
     out: list[str] = [
         f"# Journal · {window.get('since','')[:10]} → {window.get('until','')[:10]}",
@@ -73,8 +106,11 @@ def render_markdown(composed: dict[str, Any], meta: dict[str, Any]) -> str:
             out += [f"### {date}", ""]
             for entry in tree[project][date]:
                 out.append(f"#### {entry.get('title','(untitled)')}")
+                # The author is only worth a line when there is more than one:
+                # a solo journal saying "by me" on every entry is noise.
+                by = f"by {entry['author']}" if len(people) > 1 else ""
                 tags = " · ".join(
-                    t for t in (entry.get("kind"), entry.get("status")) if t
+                    t for t in (entry.get("kind"), entry.get("status"), by) if t
                 )
                 if tags:
                     out.append(f"*{tags}*")
@@ -171,8 +207,10 @@ display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
 .h1 .count{font-size:12px;font-weight:500;color:var(--muted);background:var(--bg);
 border:1px solid var(--line);padding:2px 9px;border-radius:999px;margin-left:auto}
 .h1.ax-project{color:var(--accent)}
+.h1.ax-person{color:#7a3e8f}
 .block>.h1{border-bottom:2px solid var(--fg);padding-bottom:10px;margin-bottom:20px}
 .block>.h1.ax-project{border-bottom-color:var(--accent)}
+.block>.h1.ax-person{border-bottom-color:#7a3e8f}
 .sub-block{margin:0 0 22px}
 .h2{font-size:12px;text-transform:uppercase;letter-spacing:.11em;color:var(--muted);
 margin:0 0 10px;display:flex;align-items:center;gap:10px;font-weight:700}
@@ -187,6 +225,7 @@ padding:17px 19px;margin-bottom:12px;box-shadow:var(--shadow)}
 .chip{font-size:11px;padding:2.5px 9px;border-radius:999px;background:var(--bg);
 color:var(--muted);border:1px solid var(--line)}
 .chip.k{background:var(--accent-soft);color:var(--accent);border-color:transparent}
+.chip.p{background:#efe9f5;color:#7a3e8f;border-color:transparent}
 .chip.s-landed{background:var(--ok-soft);color:var(--ok);border-color:transparent}
 .summary{margin:0 0 13px;color:#3a3a37}
 .sec{margin-top:12px}
@@ -257,6 +296,7 @@ const ENTRIES = DATA.entries || [];
 /* Projects are the top-level aggregate: that is how the work is actually
    owned, so it is what the page opens on. */
 let groupBy = 'project', view = 'journal', active = null;
+const PEOPLE = new Set(ENTRIES.map(e => e.author || 'unknown')).size;
 
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -272,9 +312,6 @@ const lines = v => !v ? [] : (Array.isArray(v) ? v : [v]).map(i => {
 }).filter(Boolean);
 
 const blockers = e => (e.blockers || []).filter(b => b && b.what && b.resolution);
-const keyOf = e => groupBy === 'date' ? (e.date || 'undated')
-               : groupBy === 'project' ? (e.project || 'unknown')
-               : (e.kind || 'other');
 const hhmm = ts => (ts || '').slice(11, 16);
 const slug = k => 'g-' + String(k).replace(/[^a-z0-9]+/gi, '-').toLowerCase();
 
@@ -289,10 +326,13 @@ const dotColor = name => {
 
 /* The aggregation you pick becomes the h1; the other axis becomes the h2
    nested inside it. Group by date and you read days containing projects;
-   group by project and you read projects containing days. */
-const SECOND = { date: 'project', project: 'date', kind: 'project' };
+   group by project and you read projects containing days; group by person and
+   you read people containing projects -- which is the question a manager
+   reading several teammates' journals actually has. */
+const SECOND = { date: 'project', project: 'date', kind: 'project', person: 'project' };
 const valueOf = (e, axis) => axis === 'date' ? (e.date || 'undated')
                           : axis === 'project' ? (e.project || 'unknown')
+                          : axis === 'person' ? (e.author || 'unknown')
                           : (e.kind || 'other');
 
 function sortKeys(keys, axis) {
@@ -315,7 +355,8 @@ function groups() {
 function renderNav() {
   const gs = groups().map(([k, items]) => [k, items]);
   document.getElementById('navlabel').textContent =
-    groupBy === 'date' ? 'Days' : groupBy === 'project' ? 'Projects' : 'Kinds';
+    groupBy === 'date' ? 'Days' : groupBy === 'project' ? 'Projects'
+    : groupBy === 'person' ? 'People' : 'Kinds';
   document.getElementById('nav').innerHTML = gs.map(([k, items]) =>
     `<a href="#${slug(k)}" data-key="${esc(k)}" class="${k === active ? 'on' : ''}">
        <span>${esc(k)}</span><span class="n">${items.length}</span></a>`).join('');
@@ -353,6 +394,8 @@ function card(e) {
 
   const chips = [
     groupBy !== 'project' && e.project && `<span class="chip">${esc(e.project)}</span>`,
+    /* Only worth a chip when the journal actually spans people. */
+    groupBy !== 'person' && PEOPLE > 1 && e.author && `<span class="chip p">${esc(e.author)}</span>`,
     e.kind && `<span class="chip k">${esc(e.kind)}</span>`,
     e.status && `<span class="chip s-${esc(e.status)}">${esc(e.status)}</span>`,
     groupBy !== 'date' && e.date && `<span class="chip">${esc(e.date)}</span>`,
@@ -419,7 +462,7 @@ function renderTimeline() {
           style="--dot:${dotColor(b.entry.project)}">
         <div class="t">${esc(hhmm(b.ts))}</div>
         <div class="body"><div class="what">${esc(b.what)}</div>
-          <div class="who">${esc(b.entry.project || '')}${b.entry.title ? ' · ' + esc(b.entry.title) : ''}</div>
+          <div class="who">${PEOPLE > 1 && b.entry.author ? esc(b.entry.author) + ' · ' : ''}${esc(b.entry.project || '')}${b.entry.title ? ' · ' + esc(b.entry.title) : ''}</div>
         </div></div>`).join('')}
     </div>`;
   }).join('') + `</div>`;
@@ -514,7 +557,8 @@ render();
 
 def render_html(composed: dict[str, Any], meta: dict[str, Any]) -> str:
     window = meta.get("window", {})
-    entries = composed.get("entries") or []
+    entries = _authors(composed.get("entries") or [], meta)
+    people = sorted({entry["author"] for entry in entries})
     skipped = composed.get("skipped") or []
     since, until = window.get("since", "")[:10], window.get("until", "")[:10]
 
@@ -525,6 +569,9 @@ def render_html(composed: dict[str, Any], meta: dict[str, Any]) -> str:
     beats = sum(len(e.get("timeline") or []) for e in entries)
     commits = sum(r.get("commits", 0) for r in meta.get("repos") or [])
     repo_note = f" · {commits} commits" if commits else ""
+    people_note = (
+        f" · {html.escape(', '.join(people))}" if len(people) > 1 else ""
+    )
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -537,12 +584,13 @@ def render_html(composed: dict[str, Any], meta: dict[str, Any]) -> str:
   <div class="switch">
     <button data-group="project" aria-pressed="true">Project</button>
     <button data-group="date" aria-pressed="false">Date</button>
+    <button data-group="person" aria-pressed="false">Person</button>
     <button data-group="kind" aria-pressed="false">Kind</button>
   </div>
   <div class="navlabel" id="navlabel">Projects</div>
   <nav id="nav"></nav>
   <div class="foot">
-    {len(entries)} items · {len(meta.get('sessions') or [])} sessions · {beats} beats{repo_note}
+    {len(entries)} items · {len(meta.get('sessions') or [])} sessions · {beats} beats{repo_note}{people_note}
   </div>
 </aside>
 <main>

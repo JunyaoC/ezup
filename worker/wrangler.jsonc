@@ -1,0 +1,33 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ezupdate",
+  // No account_id here on purpose. It is not a credential, but this repo is
+  // public and a fork should deploy into its own account, not ours. Wrangler
+  // reads CLOUDFLARE_ACCOUNT_ID from the environment instead.
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-01",
+
+  // Raw transcript chunks. Objects are immutable and keyed by byte offset, so a
+  // re-sent chunk lands on the key it already occupies and is skipped, never rewritten.
+  "r2_buckets": [
+    {
+      "binding": "BUCKET",
+      "bucket_name": "ezupdate-raw"
+    }
+  ],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ezupdate",
+      // Left as a placeholder deliberately. `./deploy.sh` writes the real uuid
+      // into wrangler.local.jsonc (gitignored) and deploys with that, so no
+      // account-specific id is ever committed.
+      "database_id": "PLACEHOLDER_D1_ID"
+    }
+  ],
+
+  "observability": {
+    "enabled": true
+  }
+}
