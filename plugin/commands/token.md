@@ -13,6 +13,6 @@ Relay the output faithfully. The token value is shown ONCE and never again:
 tell the user to copy it now and hand it to the operator, who uses it as
 `EZUPDATE_TOKEN` with the same store URL. It grants read-only access to this
 device's sessions — no writing, no deleting, no minting — and can be revoked
-any time with `ezup token revoke <id>`.
+any time with `ezup token revoke` — bare when only one token is active, or by name.
 
 Do not run any other command. Never print the token yourself a second time.

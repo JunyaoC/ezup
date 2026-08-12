@@ -163,7 +163,13 @@ def statusline(payload: dict[str, Any]) -> str:
 
             target = load_config(store, cwd).store_url
         host = target.split("//")[-1].split("/")[0] if target else "team store"
-        return f"{red}🔴 ezup REC{reset} {dim}· {project_name(cwd)} → {host}{reset}"
+        # The short session id says WHICH session is recording -- with two
+        # terminals open, "something is sharing" is not enough to act on.
+        sid = f" · {session_id[:8]}" if session_id else ""
+        return (
+            f"{red}🔴 ezup REC{reset} "
+            f"{dim}· {project_name(cwd)}{sid} → {host}{reset}"
+        )
     except Exception:
         return ""
 

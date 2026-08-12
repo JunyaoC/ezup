@@ -918,7 +918,7 @@ def cmd_token(args: argparse.Namespace) -> int:
                     "",
                     f"grants: {minted.get('grants', 'read-only access to your sessions')}",
                     "the operator uses it as EZUPDATE_TOKEN with the same store URL",
-                    f"revoke any time: ezcl token revoke {minted.get('id', '?')}",
+                    f"revoke any time: ezup token revoke {args.name}",
                 ],
             )
             return 0
@@ -933,9 +933,42 @@ def cmd_token(args: argparse.Namespace) -> int:
                 )
             _emit({"tokens": rows}, args.json, lines)
             return 0
-        # revoke
-        gone = transport.revoke_reader(args.id)
-        _emit(gone, args.json, [f"revoked {args.id}; that token stops working now"])
+        # revoke -- by id, by name, or bare when only one token is active.
+        active = [r for r in transport.list_readers() if not r.get("revoked_at")]
+        wanted = (args.id or "").strip()
+        if not wanted:
+            if len(active) == 1:
+                target = active[0]
+            elif not active:
+                print("no active reader tokens to revoke", file=sys.stderr)
+                return 1
+            else:
+                print(
+                    "several active tokens; name one:  "
+                    + "  ".join(f"{r.get('name','?')} ({r.get('id','?')[:8]})" for r in active),
+                    file=sys.stderr,
+                )
+                return 2
+        else:
+            matches = [
+                r for r in active
+                if r.get("id") == wanted
+                or str(r.get("id", "")).startswith(wanted)
+                or r.get("name") == wanted
+            ]
+            if not matches:
+                print(f"no active token matches {wanted!r}; see `ezup token list`", file=sys.stderr)
+                return 1
+            if len(matches) > 1:
+                print(f"{wanted!r} is ambiguous; use the full id from `ezup token list`", file=sys.stderr)
+                return 2
+            target = matches[0]
+        gone = transport.revoke_reader(str(target.get("id")))
+        _emit(
+            gone,
+            args.json,
+            [f"revoked {target.get('name','?')} ({target.get('id','?')}); that token stops working now"],
+        )
         return 0
     except TransportError as error:
         print(f"error: {error}", file=sys.stderr)
@@ -1258,7 +1291,12 @@ def build_parser() -> argparse.ArgumentParser:
     listing.add_argument("--json", action="store_true")
     listing.set_defaults(func=cmd_token, token_command="list")
     revoke = token_sub.add_parser("revoke", help="revoke a token you minted")
-    revoke.add_argument("id", help="token id from `ezcl token list`")
+    revoke.add_argument(
+        "id",
+        nargs="?",
+        default="",
+        help="token id, id prefix, or name; omit when only one token is active",
+    )
     revoke.add_argument("--json", action="store_true")
     revoke.set_defaults(func=cmd_token, token_command="revoke")
 

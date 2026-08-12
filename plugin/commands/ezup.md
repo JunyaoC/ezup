@@ -30,7 +30,7 @@ Then relay the command's output to the user faithfully. Points that matter:
   pre-ticked, and that is deliberate. Never suggest "select all".
 - A minted token is shown ONCE and never again: tell the user to copy it now.
   It grants read-only access to this device's sessions and is revoked with
-  `ezup token revoke <id>`. Never print the token yourself a second time.
+  `ezup token revoke` — bare when only one token is active, or by name. Never print the token yourself a second time.
 - If it refuses (for example the repo's `.ez/config.json` says `never`, or the
   policy needs acknowledging with `ezup share ack`), show the refusal reason
   verbatim rather than paraphrasing it.
