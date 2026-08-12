@@ -41,6 +41,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 
+from .crypto import GCM_TAG, KEY_PREFIXES, CryptoError, KeySet, parse_key
+
 # The store owns the temp-file + os.replace pattern; reuse it rather than
 # keeping a second copy that could drift.
 from .store import _write_json_atomic
@@ -97,9 +99,20 @@ class SessionMeta:
     title: str = ""
     level: str = "raw"
     start_offset: int = 0
+    # E2E fields (contract 6.1): "" / 0 mean "say nothing" and are dropped from
+    # the wire payload, so legacy servers and LocalDirTransport index rows never
+    # see keys they do not know about -- and, more importantly, an encrypted
+    # session's row is only ever *upgraded* by a client that set them on purpose.
+    enc: str = ""
+    enc_gen: int = 0
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        if not payload.get("enc"):
+            payload.pop("enc", None)
+        if not payload.get("enc_gen"):
+            payload.pop("enc_gen", None)
+        return payload
 
 
 @dataclass
@@ -436,15 +449,36 @@ class HttpTransport(Transport):
         base_url: str,
         token: str,
         *,
+        device_id: str = "",
         timeout: float = DEFAULT_TIMEOUT,
         upload_timeout: float = DEFAULT_UPLOAD_TIMEOUT,
         max_tries: int = MAX_TRIES,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token
+        # A pasted ezu_/ezr_ key never goes on the wire: it is parsed here,
+        # once, into the derived bearer (sent) and K_enc (kept). Any other
+        # token string -- a raw ezw_ bearer, a test fake -- is sent verbatim
+        # and leaves key_set None, which is exactly the signal publish/pull use
+        # to refuse encrypted work they could not complete.
+        self.key_set: KeySet | None = None
+        if token.startswith(KEY_PREFIXES):
+            try:
+                self.key_set = parse_key(token)
+            except CryptoError as exc:
+                raise TransportError(f"cannot use the configured key: {exc}") from exc
+        # This machine's devices.id UUID (non-secret), needed as the wrap
+        # recipient. Learned lazily from GET /v1/wrapped_keys when the config
+        # does not carry it -- see get_wrapped_keys.
+        self.device_id = device_id
         self.timeout = timeout
         self.upload_timeout = upload_timeout
         self.max_tries = max(1, max_tries)
+
+    @property
+    def recipient_id(self) -> str:
+        """The id our own wraps are addressed to (device or reader row id)."""
+        return self.device_id
 
     # -- plumbing ------------------------------------------------------------
 
@@ -468,8 +502,9 @@ class HttpTransport(Transport):
         timeout: float | None = None,
     ) -> bytes:
         url = self._url(path, params)
+        bearer = self.key_set.bearer if self.key_set is not None else self.token
         headers = {
-            "Authorization": f"Bearer {self.token}",
+            "Authorization": f"Bearer {bearer}",
             "Accept": "application/json",
             "User-Agent": "ezchangelog",
         }
@@ -536,7 +571,15 @@ class HttpTransport(Transport):
     def put_chunk(
         self, session: str, offset: int, length: int, sha256: str, data: bytes
     ) -> str:
-        if len(data) != length:
+        # ``length`` is always the *plaintext* length (contract 3.2): offsets
+        # and lengths stay plaintext addressing so the chunk-key grammar and
+        # coverage math never change. An encrypting caller therefore hands us
+        # exactly length + 16 bytes of ct||tag; a plaintext caller exactly
+        # length. Anything else is a bug worth stopping before it hits R2.
+        expected = (
+            (length, length + GCM_TAG) if self.key_set is not None else (length,)
+        )
+        if len(data) not in expected:
             raise TransportError(
                 f"chunk length mismatch for {session}: declared {length}, got {len(data)}"
             )
@@ -593,16 +636,88 @@ class HttpTransport(Transport):
             raise TransportError(f"refusing to fetch {key!r}: not a chunk key")
         return self._request("GET", "/v1/blob", params={"key": key})
 
+    # -- encryption metadata and wrapped keys ------------------------------
+    # HTTP only, like the reader-token methods below: LocalDirTransport stays
+    # plaintext by contract (D-list, section 0), so none of this belongs on
+    # the Transport ABC -- encryption lives above the ABC, in publish/pull.
+
+    def session_enc(self, session: str) -> tuple[str, int]:
+        """(enc, enc_gen) as the server reports them for one session.
+
+        Read from GET /v1/chunks' top-level fields. ("", 0) for a session the
+        server has never seen or a legacy plaintext one -- the two cases are
+        equivalent to a publisher: nothing encrypted exists to collide with.
+        """
+        try:
+            data = self._json("GET", "/v1/chunks", params={"session": session})
+        except TransportError as exc:
+            if exc.status == 404:
+                return "", 0
+            raise
+        try:
+            gen = int(data.get("enc_gen") or 0)
+        except (TypeError, ValueError):
+            gen = 0
+        return str(data.get("enc") or ""), gen
+
+    def put_wrapped_keys(self, wraps: list[dict[str, Any]]) -> int:
+        """POST /v1/wrapped_keys in batches of <= 500; returns total written.
+
+        500 is the server's per-request cap; batching here means a new-reader
+        history backfill over any number of sessions is a handful of round
+        trips instead of one per session (D3/D8).
+        """
+        written = 0
+        for start in range(0, len(wraps), 500):
+            batch = wraps[start : start + 500]
+            data = self._json(
+                "POST",
+                "/v1/wrapped_keys",
+                body=json.dumps({"wraps": batch}).encode("utf-8"),
+                content_type="application/json",
+            )
+            try:
+                written += int(data.get("written") or 0)
+            except (TypeError, ValueError):
+                written += len(batch)
+        return written
+
+    def get_wrapped_keys(self, session: str | None = None) -> list[dict[str, Any]]:
+        """GET /v1/wrapped_keys, optionally filtered to one session.
+
+        The rows are always the caller's own (recipient is the authenticated
+        identity, never a parameter). The response's top-level recipient_id is
+        the caller's devices.id -- self-information (contract Q2) -- and is
+        cached as our device_id when the config did not carry one, which is
+        how a reader key learns the id its wrap AADs are bound to.
+        """
+        data = self._json("GET", "/v1/wrapped_keys", params={"session": session})
+        learned = str(data.get("recipient_id") or "")
+        if learned and not self.device_id:
+            self.device_id = learned
+        wraps = data.get("wraps")
+        if not isinstance(wraps, list):
+            return []
+        return [row for row in wraps if isinstance(row, dict)]
+
     # -- reader tokens -----------------------------------------------------
     # Device-authenticated management of the read-only tokens a developer
     # hands to an operator. HTTP only: a local directory has no auth, so these
     # deliberately do not exist on the Transport ABC.
 
-    def mint_reader(self, name: str) -> dict[str, Any]:
+    def mint_reader(self, name: str, token_sha256: str) -> dict[str, Any]:
+        """POST /v1/token -- the hash is client-supplied (contract 5.1).
+
+        The reader secret is generated on the client and never sent; the
+        server stores only sha256 of the derived bearer, so it can
+        authenticate the reader later without ever being able to become it.
+        """
         return self._json(
             "POST",
             "/v1/token",
-            body=json.dumps({"name": name}).encode("utf-8"),
+            body=json.dumps({"name": name, "token_sha256": token_sha256}).encode(
+                "utf-8"
+            ),
             content_type="application/json",
         )
 
@@ -673,6 +788,7 @@ def build_transport(config: Mapping[str, Any] | str | Path | None) -> Transport:
         return HttpTransport(
             destination,
             token,
+            device_id=str(settings.get("device_id") or ""),
             timeout=float(settings.get("timeout", DEFAULT_TIMEOUT)),
             upload_timeout=float(settings.get("upload_timeout", DEFAULT_UPLOAD_TIMEOUT)),
             max_tries=int(settings.get("max_tries", MAX_TRIES)),

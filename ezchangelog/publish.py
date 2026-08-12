@@ -35,6 +35,7 @@ a stale timeout, so the loser waits instead of overwriting.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import json
@@ -47,6 +48,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
 
+from .crypto import (
+    ENC_SCHEME,
+    CryptoError,
+    encrypt_chunk,
+    new_data_key,
+    unwrap_dk,
+    wrap_dk,
+)
 from .store import Store, _write_json_atomic
 from .transport import SessionMeta, Transport, TransportError, chunk_key
 from .window import isoformat
@@ -147,6 +156,14 @@ class PublishState:
     chunks: list[dict[str, Any]] = field(default_factory=list)
     last_published: str | None = None
     store: str = ""
+    # E2E fields (contract 6.2). The plaintext DK lives in memory only; at
+    # rest it exists solely as ``dk_wrapped``, a self-wrap only the configured
+    # device key can open. Discipline, not a boundary -- the plaintext
+    # transcript sits in the same directory -- but it keeps DKs out of
+    # backups and diffs. Defaults keep pre-E2E state files loading unchanged.
+    enc: str = ""               # "" = plaintext; "aead-v1" = encrypted
+    enc_gen: int = 0            # 0 = plaintext state; >= 1 = encrypted generation
+    dk_wrapped: str = ""        # base64 60-byte self-wrap (recipient = this device)
 
     @staticmethod
     def path_for(store: Store, session: str) -> Path:
@@ -194,6 +211,17 @@ class PublishState:
         self.prefix_len = 0
         self.published_sha256 = ""
         self.chunks = []
+        if self.enc == ENC_SCHEME:
+            # RULE R1 (contract 3.1), enforced here and only here: a reset
+            # means offsets already encrypted under the current DK may be
+            # re-sent with different plaintext, and a repeated GCM nonce with
+            # different plaintext is catastrophic. Bump the generation --
+            # every nonce is BE4(gen)||BE8(offset), so a new gen is a disjoint
+            # nonce space -- and drop the wrap so the next publish must mint a
+            # fresh DK (it reconciles this gen to max(local, server) + 1
+            # before encrypting anything).
+            self.enc_gen += 1
+            self.dk_wrapped = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -310,6 +338,21 @@ def _digest_range(path: Path, start: int, end: int) -> "hashlib._Hash":
             digest.update(block)
             remaining -= len(block)
     return digest
+
+
+def _read_range(path: Path, offset: int, length: int) -> bytes:
+    """The exact bytes at ``[offset, offset + length)``, or OSError.
+
+    A short read raises rather than returning what it got, for the same
+    reason as :func:`_digest_range`: bytes the file no longer holds are a
+    condition to surface, never to hash over.
+    """
+    with path.open("rb") as handle:
+        handle.seek(offset)
+        data = handle.read(length)
+    if len(data) != length:
+        raise OSError(f"{path} ended before byte {offset + length}")
+    return data
 
 
 def _verify_published(
@@ -517,6 +560,236 @@ def _touch(path: Path) -> None:
         pass
 
 
+# -- encryption ---------------------------------------------------------------
+# Contract 6.2. Everything here runs strictly on the client: the transport
+# only ever sees ciphertext bodies, ciphertext sha256s, and opaque 60-byte
+# wraps. Plaintext addressing (offsets, lengths, coverage) is untouched.
+
+
+@dataclass
+class _Cipher:
+    """One session's live encryption context for the duration of a publish."""
+
+    dk: bytes
+    gen: int
+    # Wraps minted alongside a fresh DK, pending upload. Emptied once sent so
+    # a 409-recovery loop cannot upload them twice.
+    wraps: list[dict[str, Any]] = field(default_factory=list)
+    # Nonce-reuse tripwire: within this process, offset -> sha256(plaintext)
+    # of what was encrypted there. The nonce is (gen, offset), so encrypting
+    # *different* plaintext at a seen offset under this DK would be the one
+    # unforgivable GCM failure. R1 makes it unreachable (any such path rotated
+    # the DK first); the assertion is the proof-in-depth that it stayed so.
+    _sealed: dict[int, str] = field(default_factory=dict)
+
+    def encrypt(self, session: str, offset: int, plaintext: bytes) -> bytes:
+        fingerprint = hashlib.sha256(plaintext).hexdigest()
+        previous = self._sealed.setdefault(offset, fingerprint)
+        # A hard raise, not an assert: `python -O` strips asserts, and a
+        # nonce-reuse tripwire that vanishes under optimisation is no tripwire.
+        # (Review F4.)
+        if previous != fingerprint:
+            raise CryptoError(
+                f"GCM nonce reuse: offset {offset} of {session} was already "
+                f"encrypted with different plaintext under gen {self.gen} "
+                f"(RULE R1 violated)"
+            )
+        return encrypt_chunk(self.dk, session, self.gen, offset, plaintext)
+
+
+def _encryption_active(transport: Transport) -> bool:
+    """Encrypt exactly when the transport holds a pasted *device* key.
+
+    ``key_set`` only exists on HttpTransport and only when the configured
+    token parsed as ezu_/ezr_ (contract 6.1). LocalDirTransport stays
+    plaintext by contract; a raw ezw_ bearer can authenticate but not derive
+    K_enc, so it cannot encrypt -- the caller separately refuses to *downgrade*
+    a session such a config has already published encrypted.
+    """
+    key_set = getattr(transport, "key_set", None)
+    return key_set is not None and key_set.kind == "device"
+
+
+def _server_enc(transport: Transport, session_id: str) -> tuple[str, int]:
+    """What the store says about a session's encryption: ("", 0) when it
+    cannot say (a local directory, or a session the store never saw)."""
+    probe = getattr(transport, "session_enc", None)
+    if probe is None:
+        return "", 0
+    return probe(session_id)
+
+
+def readers_path(store: Store) -> Path:
+    return store.root / "readers.json"
+
+
+def _load_readers(store: Store) -> list[dict[str, str]]:
+    """Reader grants this device wraps new DKs for (contract 6.3).
+
+    Machine-private, written by ``token mint``. Malformed entries are skipped
+    rather than fatal: a broken grants file must degrade to "that reader gets
+    no wrap", never to "the developer cannot publish".
+    """
+    data = _read_json(readers_path(store))
+    if not isinstance(data, dict) or not isinstance(data.get("readers"), list):
+        return []
+    out: list[dict[str, str]] = []
+    for row in data["readers"]:
+        if not isinstance(row, dict):
+            continue
+        reader_id = str(row.get("reader_id") or "")
+        enc_key = str(row.get("enc_key") or "")
+        if reader_id and len(enc_key) == 64:
+            out.append({"reader_id": reader_id, "enc_key": enc_key})
+    return out
+
+
+def _require_device_id(transport: Transport) -> str:
+    device_id = str(getattr(transport, "device_id", "") or "")
+    if not device_id:
+        raise TransportError(
+            "encrypted publishing needs this machine's device id (the UUID "
+            "printed by 'ezup device mint'); add \"device_id\" to "
+            "<store>/config.json or set EZUPDATE_DEVICE_ID"
+        )
+    return device_id
+
+
+def _setup_cipher(
+    session_id: str,
+    transport: Transport,
+    store: Store,
+    state: PublishState,
+) -> tuple[_Cipher, bool]:
+    """The DK to encrypt with, minting and rotating per contract 6.2 step 1.
+
+    Returns ``(cipher, rotated)``; ``rotated`` is True when the persisted
+    self-wrap was unreadable and R1 forced a reset the caller must fold into
+    its report (and re-plan from).
+    """
+    key_set = transport.key_set  # type: ignore[attr-defined]  # guarded by _encryption_active
+    device_id = _require_device_id(transport)
+
+    rotated = False
+    if state.enc == ENC_SCHEME and state.enc_gen >= 1 and state.dk_wrapped:
+        try:
+            dk = unwrap_dk(
+                key_set.enc_key,
+                session_id,
+                device_id,
+                state.enc_gen,
+                base64.b64decode(state.dk_wrapped),
+            )
+            return _Cipher(dk=dk, gen=state.enc_gen), False
+        except (CryptoError, ValueError):
+            # The at-rest wrap cannot be opened (corrupt state, or the device
+            # key changed). We cannot prove we hold the DK this generation
+            # encrypted under, so appending to it is off the table: R1 says
+            # rotate. reset() bumps enc_gen and clears the wrap.
+            state.reset()
+            rotated = True
+
+    # One rule covers every path (fresh session: max(0, 0) + 1; lost local
+    # state: server + 1; post-reset: the local value is already bumped).
+    # Generations need only be strictly increasing, never dense, so a skipped
+    # number is harmless -- the invariant bought here is that the new gen is
+    # strictly greater than anything either side has ever encrypted under.
+    _, server_gen = _server_enc(transport, session_id)
+    gen = max(state.enc_gen, server_gen) + 1
+    dk = new_data_key()
+
+    self_wrap = base64.b64encode(
+        wrap_dk(key_set.enc_key, session_id, device_id, gen, dk)
+    ).decode("ascii")
+    wraps = [
+        {
+            "session": session_id,
+            "recipient_id": device_id,
+            "enc_gen": gen,
+            "wrap": self_wrap,
+        }
+    ]
+    # Every granted reader gets the new DK wrapped under *their* K_enc. This
+    # is the only moment the plaintext DK and the grant list coexist, so
+    # future-session sharing costs nothing at read time.
+    for reader in _load_readers(store):
+        try:
+            blob = wrap_dk(
+                bytes.fromhex(reader["enc_key"]),
+                session_id,
+                reader["reader_id"],
+                gen,
+                dk,
+            )
+        except (CryptoError, ValueError):
+            continue  # One bad grant entry must not block the publish.
+        wraps.append(
+            {
+                "session": session_id,
+                "recipient_id": reader["reader_id"],
+                "enc_gen": gen,
+                "wrap": base64.b64encode(blob).decode("ascii"),
+            }
+        )
+
+    state.enc = ENC_SCHEME
+    state.enc_gen = gen
+    state.dk_wrapped = self_wrap
+    return _Cipher(dk=dk, gen=gen, wraps=wraps), rotated
+
+
+def _reconcile_dk(
+    session_id: str,
+    transport: Transport,
+    state: PublishState,
+    server_gen: int,
+) -> tuple[bytes, str] | str:
+    """(DK, base64 self-wrap) for verifying remote ciphertext, or the reason
+    verification is impossible (which the caller treats as a mismatch)."""
+    key_set = getattr(transport, "key_set", None)
+    if key_set is None or key_set.kind != "device":
+        # Never silently downgrade: a config that cannot decrypt must not be
+        # allowed to conclude "mismatch" and replace the encrypted session
+        # with plaintext.
+        raise TransportError(
+            f"session {session_id} is stored encrypted; configure the pasted "
+            f"ezu_ device key, not a raw bearer"
+        )
+    device_id = _require_device_id(transport)
+
+    blob_b64 = ""
+    if state.enc == ENC_SCHEME and state.enc_gen == server_gen and state.dk_wrapped:
+        blob_b64 = state.dk_wrapped
+    else:
+        # Lost or stale local state: recover the DK from the self-wrap the
+        # last publish parked server-side (contract D8).
+        fetch = getattr(transport, "get_wrapped_keys", None)
+        rows = fetch(session_id) if fetch is not None else []
+        if rows:
+            try:
+                row_gen = int(rows[0].get("enc_gen") or 0)
+            except (TypeError, ValueError):
+                row_gen = -1
+            if row_gen == server_gen:
+                blob_b64 = str(rows[0].get("wrap") or "")
+    if not blob_b64:
+        return (
+            "the store's wrapped key for this session is missing or from a "
+            "different generation"
+        )
+    try:
+        dk = unwrap_dk(
+            key_set.enc_key,
+            session_id,
+            device_id,
+            server_gen,
+            base64.b64decode(blob_b64),
+        )
+    except (CryptoError, ValueError):
+        return "the wrapped key for this session cannot be opened by this device key"
+    return dk, blob_b64
+
+
 # -- reconciliation -----------------------------------------------------------
 
 
@@ -547,6 +820,22 @@ def reconcile(
     if not remote:
         return None
 
+    # For an encrypted session the remote sha256s are ciphertext hashes, so
+    # "does the store match the disk" is answered by deterministic
+    # re-encryption: same DK, same (gen, offset) nonce, same plaintext =>
+    # byte-identical ciphertext. Any failure to *obtain* the DK is treated
+    # exactly like a hash mismatch (contract 6.2 step 5): the conflict path
+    # replaces the remote copy and rotates under R1 -- which is always safe,
+    # merely not free.
+    server_enc, server_gen = _server_enc(transport, session_id)
+    dk: bytes | None = None
+    dk_wrapped = ""
+    if server_enc == ENC_SCHEME:
+        prepared = _reconcile_dk(session_id, transport, state, server_gen)
+        if isinstance(prepared, str):
+            return prepared
+        dk, dk_wrapped = prepared
+
     base = remote[0].offset
     cursor = base
     verified: list[dict[str, Any]] = []
@@ -554,10 +843,18 @@ def reconcile(
         if chunk.offset != cursor:
             break  # A hole: nothing past it can be trusted as a prefix.
         try:
-            digest = _digest_range(path, chunk.offset, chunk.offset + chunk.length)
+            if dk is not None:
+                local = _read_range(path, chunk.offset, chunk.length)
+                current = hashlib.sha256(
+                    encrypt_chunk(dk, session_id, server_gen, chunk.offset, local)
+                ).hexdigest()
+            else:
+                current = _digest_range(
+                    path, chunk.offset, chunk.offset + chunk.length
+                ).hexdigest()
         except OSError:
             break  # The local file is shorter than the store claims.
-        if digest.hexdigest() != chunk.sha256:
+        if current != chunk.sha256:
             break  # The store holds different bytes here.
         verified.append(
             {"offset": chunk.offset, "length": chunk.length, "sha256": chunk.sha256}
@@ -575,8 +872,14 @@ def reconcile(
     state.size = cursor
     state.chunks = verified[-MAX_STATE_CHUNKS:]
     state.prefix_sha256, state.prefix_len = _prefix_sha256(path, cursor)
+    # The published-range digest stays a *plaintext* digest either way: it is
+    # local bookkeeping against the transcript on disk, not a wire value.
     state.published_sha256 = _digest_range(path, base, cursor).hexdigest()
     state.store = transport.describe()
+    if dk is not None:
+        state.enc = ENC_SCHEME
+        state.enc_gen = server_gen
+        state.dk_wrapped = dk_wrapped
     return (
         f"rebuilt publish state from the store: {len(remote)} chunk(s) listed, "
         f"verified through byte {cursor}"
@@ -678,6 +981,16 @@ def _publish_locked(
     # a rewritten document and trigger a needless full re-upload.
     size = path.stat().st_size
 
+    enc_active = _encryption_active(transport)
+    if state.enc == ENC_SCHEME and not enc_active:
+        # A session already published encrypted must never be silently
+        # downgraded: a raw ezw_ bearer (or a switched-in local store) can
+        # authenticate but cannot derive K_enc, so it fails loudly instead.
+        raise TransportError(
+            f"session {session_id} is published encrypted; configure the "
+            f"pasted ezu_ device key, not a raw bearer or a plain directory"
+        )
+
     if not dry_run and _needs_reconcile(state):
         report.reconciled = reconcile(session_id, path, transport, state)
 
@@ -686,6 +999,36 @@ def _publish_locked(
     if report.reset_reason:
         state.reset()
         report.deleted_remote = had_published and delete_on_reset
+
+    if enc_active and state.enc != ENC_SCHEME and had_published:
+        # First encrypted publish of a session that already has plaintext in
+        # the store (a legacy session mid-migration, contract section 8 step
+        # 4): replace it wholesale. The plaintext chunks are deleted -- not
+        # gated on delete_on_reset, because leaving a plaintext copy beside
+        # the encrypted one would defeat the migration -- and everything above
+        # the consent watermark is re-sent encrypted.
+        if state.published:
+            state.reset()
+            running = hashlib.sha256()
+        report.reset_reason = report.reset_reason or (
+            "first encrypted publish replaces the plaintext copy in the store"
+        )
+        report.deleted_remote = True
+
+    # Cipher setup happens BEFORE planning because an unreadable self-wrap
+    # forces an R1 reset, and the plan must reflect the state that reset left
+    # behind. Contract ordering (row, then wraps, then ciphertext) is honoured
+    # below: nothing minted here touches the wire until after put_session.
+    cipher: _Cipher | None = None
+    if enc_active and not dry_run:
+        cipher, rotated = _setup_cipher(session_id, transport, store, state)
+        if rotated:
+            running = hashlib.sha256()
+            report.reset_reason = report.reset_reason or (
+                "this device's wrapped data key is unreadable; rotating the "
+                "key and re-sending (RULE R1)"
+            )
+            report.deleted_remote = True
 
     report.file_size = size
     report.start_offset = min(plan_start(state), size)
@@ -705,7 +1048,15 @@ def _publish_locked(
         # watermark rides along so a puller can tell a session that starts at
         # byte 40_000 from an index with its first chunk missing.
         info.start_offset = state.start_offset
+        if cipher is not None:
+            info.enc = state.enc
+            info.enc_gen = state.enc_gen
         transport.put_session(info)
+        if cipher is not None and cipher.wraps:
+            # Wraps land before the first ciphertext byte (contract 6.2 step
+            # 2), so any puller that can see a chunk can resolve its DK.
+            transport.put_wrapped_keys(cipher.wraps)  # type: ignore[attr-defined]
+            cipher.wraps = []
 
     prefix, prefix_len = _prefix_sha256(path, size)
     conflicts = 0
@@ -716,6 +1067,7 @@ def _publish_locked(
                 plan, path, session_id, info, transport, store, state, report,
                 running=running, prefix=prefix, prefix_len=prefix_len,
                 dry_run=dry_run, scan_secrets=scan_secrets, lock=lock,
+                cipher=cipher,
             )
             return report
         except TransportError as exc:
@@ -731,14 +1083,12 @@ def _publish_locked(
             note = reconcile(session_id, path, transport, state)
             if state.offset <= before:
                 transport.delete_session(session_id)
-                state.reset()
+                state.reset()  # R1: for an encrypted session this bumps the gen
                 report.deleted_remote = True
                 report.reset_reason = (
                     f"the store holds different bytes for this session "
                     f"(HTTP 409); replaced it from offset {state.start_offset}"
                 )
-                info.start_offset = state.start_offset
-                transport.put_session(info)
             report.reconciled = note or report.reconciled
             state.save(store)
             report.reset_reason, running = _verify_published(path, state, size)
@@ -747,6 +1097,20 @@ def _publish_locked(
                 running = hashlib.sha256()
             plan = plan_chunks(path, state, max_chunk=max_chunk, size=size)
             report.start_offset = min(plan_start(state), size)
+            if plan and enc_active:
+                # Whatever the recovery decided, the DK must match the state
+                # it left: a reset cleared the wrap, so this mints a fresh DK
+                # at a strictly higher generation; a successful reconcile
+                # restored the server's wrap, so this reuses it.
+                cipher, _ = _setup_cipher(session_id, transport, store, state)
+                info.enc = state.enc
+                info.enc_gen = state.enc_gen
+            if plan:
+                info.start_offset = state.start_offset
+                transport.put_session(info)
+                if cipher is not None and cipher.wraps:
+                    transport.put_wrapped_keys(cipher.wraps)  # type: ignore[attr-defined]
+                    cipher.wraps = []
     return report
 
 
@@ -766,8 +1130,16 @@ def _send(
     dry_run: bool,
     scan_secrets: bool,
     lock: Path | None,
+    cipher: _Cipher | None = None,
 ) -> None:
-    """Ship every chunk of ``plan``, checkpointing the state as it goes."""
+    """Ship every chunk of ``plan``, checkpointing the state as it goes.
+
+    With a ``cipher``, the wire body is ct||tag and the declared sha256 is of
+    that ciphertext (contract 3.2) -- while everything a human consents to
+    (previews, line counts, the report's per-chunk sha) and everything the
+    compaction guard hashes (``running``/``published_sha256``) stays plaintext,
+    because those answer questions about the transcript on disk.
+    """
     for chunk in plan:
         data = chunk.read(path)
         if scan_secrets:
@@ -787,12 +1159,19 @@ def _send(
         )
 
         if not dry_run:
+            if cipher is not None:
+                body = cipher.encrypt(session_id, chunk.offset, data)
+                wire_sha = hashlib.sha256(body).hexdigest()
+            else:
+                body, wire_sha = data, chunk.sha256
             entry.key = transport.put_chunk(
-                session_id, chunk.offset, chunk.length, chunk.sha256, data
+                session_id, chunk.offset, chunk.length, wire_sha, body
             ) or key
             entry.sent = True
             running.update(data)
-            state.record_chunk(chunk.offset, chunk.length, chunk.sha256)
+            # The recorded sha is the *wire* sha, so state, server listings
+            # and reconcile all speak about the same bytes.
+            state.record_chunk(chunk.offset, chunk.length, wire_sha)
             state.offset = chunk.end
             state.size = max(state.size, chunk.end)
             state.prefix_sha256 = prefix
@@ -908,6 +1287,7 @@ __all__ = [
     "plan_chunks",
     "plan_start",
     "publish",
+    "readers_path",
     "reconcile",
     "secret_scan",
     "state_lock",

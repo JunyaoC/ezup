@@ -49,8 +49,9 @@ fi
 
 # -- 3. the package ----------------------------------------------------------
 step "package"
-# No third-party dependencies; this is for the `ezcl` entry point and so the
-# module resolves from any directory.
+# Installs the one third-party dependency (`cryptography`, for client-side
+# E2E encryption in ezchangelog/crypto.py) alongside the `ezcl` entry point,
+# so the module resolves from any directory.
 VIRTUAL_ENV="$HERE/.venv" uv pip install --quiet -e .
 ok "ezchangelog installed (editable)"
 ok "$(.venv/bin/python -c 'import ezchangelog; print("version " + ezchangelog.__version__)')"

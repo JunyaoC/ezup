@@ -39,15 +39,25 @@ npx wrangler types && npx tsc --noEmit
 
 ## Authentication
 
-Every route except `POST /v1/device` requires a device token:
+Every route except `POST /v1/device` requires a bearer:
 
 ```
-Authorization: Bearer ezu_<64 hex chars>
+Authorization: Bearer ezw_<64 hex chars>
 ```
 
-Only the SHA-256 of the token is stored, in `devices.token_sha256`. The
-plaintext exists exactly once, in the response to `POST /v1/device`. Revoke by
-setting `revoked_at`:
+Under the E2E contract (`docs/E2E-CONTRACT.md`) the pasted `ezu_`/`ezr_` key
+never leaves the client. The client HKDF-derives two independent values from
+it: `K_auth`, sent as the `ezw_` wire bearer above, and `K_enc`, the encryption
+key the server never sees. The worker's side of this is deliberately boring —
+`authenticate()` hashes whatever bearer string arrives and looks the digest up
+in `devices.token_sha256`, exactly as before. What flipped is *who registers
+the hash*: mint requests now carry a client-computed `token_sha256`
+(`sha256("ezw_" + hex(K_auth))`), and no mint response ever contains a token.
+A captured bearer (or a fully compromised worker) can impersonate the identity
+on the API but can never decrypt a chunk, because `K_enc` is not derivable from
+`K_auth`.
+
+Revoke by setting `revoked_at`:
 
 ```sh
 npx wrangler d1 execute ezupdate --remote \
@@ -92,37 +102,59 @@ different bytes / unowned session, 413 chunk over 8 MB or a body longer than it
 declared, 429 too many failed admin attempts, 502 object storage write failed
 (retryable), 500 otherwise.
 
-Below, `$STORE` is the worker URL and `$TOKEN` a device token.
+Below, `$STORE` is the worker URL and `$TOKEN` / `$BEARER` the derived `ezw_`
+wire bearer of a device key (readers where noted).
 
 ## `POST /v1/device`
 
-Mints a device token. Requires `Authorization: Bearer $ADMIN_TOKEN`.
+Registers a device. Requires `Authorization: Bearer $ADMIN_TOKEN`. The client
+(the `device mint` CLI) generates the `ezu_` secret locally and sends only the
+sha256 of its derived `ezw_` bearer; the response carries no token because the
+server never had one. The returned `id` is the device's `devices.id` — the
+client records it as `device_id` (it is the recipient of the device's own
+wrapped keys).
 
 ```sh
 curl -X POST "$STORE/v1/device" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H 'content-type: application/json' \
-  -d '{"name":"junyao-mbp","email":"junyao@example.com"}'
-# 201 {"token":"ezu_3f0a…","id":"…","role":"device"}
+  -d '{"name":"junyao-mbp","email":"junyao@example.com",
+       "token_sha256":"01d236f19c3dfb00fa29e633cd93cc5c8f97893db5fbd0c095280156499b58d8"}'
+# 201 {"id":"…","role":"device"}
 ```
 
-Pass `"role":"reader"` for the PM's puller:
-
-```sh
-curl -X POST "$STORE/v1/device" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H 'content-type: application/json' \
-  -d '{"name":"pm-laptop","email":"pm@example.com","role":"reader"}'
-```
-
-The row and the token are created in one statement, so a database failure never
-leaves a minted token with nothing behind it — you get a `500` and no token.
+`role` may only be `"device"` (or omitted). `"role":"reader"` is a `400`: the
+admin-minted global reader is gone. Readers are minted exclusively by the
+device whose sessions they will read (`POST /v1/token`), so every reader is
+scoped and a leaked reader key can never read the whole team. A `token_sha256`
+that is already registered is a `409`.
 
 Failed attempts are counted per client IP in `admin_failures`: 5 failures in 15
 minutes lock that IP out of this route for 15 minutes (`429` with
 `Retry-After`), and a correct token clears the counter. Failures are logged as
 IP and reason only. Neither the guessed token nor its digest is ever written to
 a log line, because a digest of a near-miss is still worth grinding offline.
+
+## `POST /v1/token`
+
+Mints a reader scoped to the calling device (device tokens only). Same E2E
+shape as `POST /v1/device`: the device generates the `ezr_` secret locally,
+registers the derived bearer's hash, and the response is metadata only. The
+returned `id` is what the device wraps data keys to, and what the reader's own
+tooling learns back from `GET /v1/wrapped_keys`.
+
+```sh
+curl -X POST "$STORE/v1/token" \
+  -H "Authorization: Bearer $BEARER" \
+  -H 'content-type: application/json' \
+  -d '{"name":"maria","token_sha256":"<64 lowercase hex>"}'
+# 201 {"id":"…","grants":"read-only access to sessions published by device junyao-mbp"}
+```
+
+`GET /v1/tokens` lists the calling device's readers (id, name, dates — there is
+no secret to leak); `DELETE /v1/token?id=…` revokes one. Revocation kills the
+reader's auth immediately; its existing `wrapped_keys` rows become inert and it
+can never receive a new grant.
 
 ## `POST /v1/session`
 
@@ -138,15 +170,37 @@ curl -X POST "$STORE/v1/session" \
   -d '{"session":"0f3c1e88-...","author":"junyao","project":"ez-change-log",
        "branch":"main","cwd":"/Users/junyao/lab/ez-change-log",
        "first_ts":"2026-08-11T08:00:00Z","last_ts":"2026-08-11T09:10:00Z",
-       "title":"share consent model","level":"raw"}'
+       "title":"share consent model","level":"raw",
+       "enc":"aead-v1","enc_gen":1}'
 # {"ok":true}
 ```
+
+`enc` and `enc_gen` are the E2E markers, both optional so legacy clients keep
+working (omitted means "leave the stored values alone"):
+
+- `enc` may transition `NULL → 'aead-v1'` and never back. Any other value —
+  including an explicit `null` on a session already marked `aead-v1` — is
+  `400 cannot downgrade an encrypted session`. Setting `enc` requires
+  `enc_gen >= 1`.
+- `enc_gen` may only stay equal or increase; a decrease is the same `400`. The
+  guard is inside the upsert statement itself, so two racing requests cannot
+  land a stale generation after a newer one — nonces are derived from
+  `(enc_gen, offset)` client-side, and a rolled-back generation would reuse
+  them.
 
 ## `POST /v1/chunk`
 
 Appends one byte range to a session you own. The body is the raw slice of the
 transcript; `sha256` is its digest, verified against the bytes actually
 received. Max 8 MB per chunk — the client splits anything larger.
+
+For a session registered with `enc = 'aead-v1'` the body is AES-256-GCM
+ciphertext: exactly `length + 16` bytes for a `length`-byte plaintext range
+(the appended GCM tag). `offset` and `length` stay plaintext addressing — the
+R2 key is an address, not a size claim — and `sha256` is the digest of the
+ciphertext body, so dedupe, 409 conflicts and pull verification are
+mechanically unchanged. The worker checks the shape and the hash; it cannot
+check, and never sees, the plaintext.
 
 ```sh
 dd if=~/.ezchangelog/raw/ez-change-log/$SESSION.jsonl bs=1 skip=0 count=8192 \
@@ -196,8 +250,13 @@ curl "$STORE/v1/sessions?since=2026-08-11T00:00:00Z" \
 # {"sessions":[{"session":"0f3c1e88-...","author":"junyao","project":"ez-change-log",
 #   "branch":"main","cwd":"/Users/junyao/lab/ez-change-log",
 #   "title":"share consent model","first_ts":"...","last_ts":"...",
-#   "size":81920,"updated_at":"2026-08-11T09:11:02.417Z"}]}
+#   "size":81920,"updated_at":"2026-08-11T09:11:02.417Z",
+#   "enc":"aead-v1","enc_gen":1}]}
 ```
+
+Rows carry `enc` (`null` = legacy plaintext, `"aead-v1"` = encrypted) and
+`enc_gen`, so a puller or the viewer knows which decode path each session
+takes before fetching anything.
 
 `cwd` is part of the row: a pulled session that loses its directory loses the
 only thing that says which checkout it came from.
@@ -218,8 +277,16 @@ order reproduces the transcript byte for byte. Readable by the owner and by any
 
 ```sh
 curl "$STORE/v1/chunks?session=$SESSION" -H "Authorization: Bearer $TOKEN"
-# {"chunks":[{"offset":0,"length":8192,"sha256":"…","key":"raw/junyao/…/000000000000-8192.jsonl"}]}
+# {"chunks":[{"offset":0,"length":8192,"sha256":"…","key":"raw/junyao/…/000000000000-8192.jsonl"}],
+#  "enc":"aead-v1","enc_gen":1}
 ```
+
+The manifest carries the session's `enc` and `enc_gen` at top level: an
+encrypted puller reconstructs each chunk's nonce as
+`BE4(enc_gen) || BE8(offset)` and needs the generation next to the offsets it
+applies to. For an encrypted session each blob is `length + 16` bytes and
+`sha256` is over the ciphertext; concatenating the *decrypted* chunks in offset
+order reproduces the transcript.
 
 ## `GET /v1/blob`
 
@@ -231,6 +298,59 @@ the key, and another team's key is a `404`.
 curl "$STORE/v1/blob?key=raw/junyao/$SESSION/000000000000-8192.jsonl" \
   -H "Authorization: Bearer $TOKEN" >> ~/.ezchangelog/pulled/junyao/$SESSION.jsonl
 ```
+
+## `POST /v1/wrapped_keys`
+
+Stores wrapped data keys — device tokens only. Each encrypted session has a
+random 32-byte data key DK; the device wraps it (AES-256-GCM under the
+recipient's key-encryption key) once for itself and once per reader it minted,
+and stores the wraps here. A wrap is an opaque base64 blob decoding to exactly
+60 bytes (12 nonce + 32 ct + 16 tag); the worker validates that shape,
+ownership, and the recipient — nothing more, because nothing more is checkable
+without a key it must not have.
+
+```sh
+curl -X POST "$STORE/v1/wrapped_keys" \
+  -H "Authorization: Bearer $BEARER" \
+  -H 'content-type: application/json' \
+  -d '{"wraps":[{"session":"0f3c1e88-...","recipient_id":"<devices.id>",
+                 "enc_gen":1,"wrap":"<base64, 60 bytes>"}]}'
+# {"ok":true,"written":1}
+```
+
+At most 500 entries per request. Per entry: the session must be a live one the
+caller owns, `recipient_id` must be the caller's own `devices.id` or an
+**unrevoked** reader the caller minted (revoked readers never receive new
+grants), `enc_gen >= 1`. Any invalid entry is a `400` naming its index and
+nothing is written; otherwise every entry is upserted on
+`(session, recipient_id)` in one atomic batch — the owning device is
+authoritative, so a rotation's re-wrap simply overwrites.
+
+## `GET /v1/wrapped_keys`
+
+Returns the wraps addressed to the authenticated caller. There is no
+`recipient_id` parameter: possession of the bearer *is* possession of the
+wraps, so asking for someone else's rows is not expressible. The caller's own
+`devices.id` is returned as `recipient_id` because it is a component of the
+unwrap AAD and a freshly-onboarded reader has no other way to learn it
+(self-information only).
+
+```sh
+# One session (must be readable; unknown/unreadable is 404, readable-but-no-
+# wrap is an empty list):
+curl "$STORE/v1/wrapped_keys?session=$SESSION" -H "Authorization: Bearer $BEARER"
+# {"recipient_id":"<caller devices.id>",
+#  "wraps":[{"session":"0f3c1e88-...","enc_gen":1,"wrap":"<base64>"}]}
+
+# Everything (recovery/backfill: a device holding only its pasted key rebuilds
+# every DK from its self-wraps; a reader bootstraps its whole history):
+curl "$STORE/v1/wrapped_keys" -H "Authorization: Bearer $BEARER"
+```
+
+The bulk form is restricted to sessions the caller may read and is unpaginated
+by contract — it is bounded by the caller's own session count. There is no
+DELETE: a revoked reader's rows are inert (its auth is dead), and
+`DELETE /v1/session` cascades the session's wraps.
 
 ## Migrating a deployed table
 
@@ -309,6 +429,72 @@ ability to read the rest of the team.
 The old `idx_sessions_updated_at` index is no longer used by any query and can
 be dropped (`DROP INDEX IF EXISTS idx_sessions_updated_at`) once the migration
 is confirmed.
+
+## Migrating to end-to-end encryption
+
+The E2E cutover (contract: `docs/E2E-CONTRACT.md`, §8) is **mark-legacy**:
+sessions already published in plaintext stay as they are and render with a
+"legacy: stored unencrypted" badge — re-encrypting bytes the operator has
+already seen would add zero confidentiality and only manufacture the
+appearance of protection. Still-growing sessions re-publish encrypted through
+the client's normal reset path, which deletes their plaintext chunks. Every
+token is re-minted, because the old scheme sent the secret itself as the
+bearer. In order:
+
+**1. Schema first** (additive, no data loss; existing rows become
+`enc = NULL` / `enc_gen = 0`, which *is* the legacy marker):
+
+```sh
+npx wrangler d1 export ezupdate --remote --output=./backup-pre-e2e.sql
+
+# One statement per call, same rationale as above: ALTER is not idempotent,
+# and a re-run only re-hits statements that already applied ("duplicate
+# column name", safe). The statements also live in worker/migrate-e2e.sql.
+npx wrangler d1 execute ezupdate --remote \
+  --command "ALTER TABLE sessions ADD COLUMN enc TEXT"
+npx wrangler d1 execute ezupdate --remote \
+  --command "ALTER TABLE sessions ADD COLUMN enc_gen INTEGER NOT NULL DEFAULT 0"
+
+# wrapped_keys and its index are CREATE ... IF NOT EXISTS:
+npx wrangler d1 execute ezupdate --remote --file=./schema.sql
+```
+
+**2. Deploy the new worker.** Old clients keep working against it: plaintext
+sessions take the legacy code paths, and the only routes that changed
+incompatibly are the mints.
+
+**3. Re-mint everything.** Each dev runs the new `device mint` (generates
+`ezu_` locally, registers `token_sha256`, records the returned `device_id`),
+then `token mint` per reader. Then revoke every pre-cutover row and remap
+session ownership to the new device ids — re-minted devices get new
+`devices.id`s, and a legacy session left pointing at the old id freezes under
+the foreign-owner rule:
+
+```sh
+npx wrangler d1 execute ezupdate --remote \
+  --command "SELECT id, name, email, role, created_at FROM devices WHERE revoked_at IS NULL"
+
+# For each old/new device pair:
+npx wrangler d1 execute ezupdate --remote \
+  --command "UPDATE sessions SET device_id = '<new-uuid>' WHERE device_id = '<old-uuid>'"
+
+# Then kill the old tokens (pick the cutover timestamp):
+npx wrangler d1 execute ezupdate --remote \
+  --command "UPDATE devices SET revoked_at = datetime('now') WHERE created_at < '<cutover-iso>'"
+```
+
+This is the accepted breaking change: old bearers 401 from here on.
+
+**4. Nothing else.** Finished legacy sessions stay plaintext with the badge
+until their dev unpublishes them. A still-growing legacy session is handled by
+the client: its first encrypted publish sees plaintext already on the server
+and takes the reset path (`DELETE /v1/session`, which removes the plaintext
+chunks, then a full encrypted re-send from the consent watermark).
+
+**5. Verify.** Pull a migrated session with a reader key and diff it
+byte-identical against the dev's local transcript; `GET /v1/blob` of a new
+chunk returns high-entropy bytes of length `length + 16`; an old bearer 401s;
+the viewer's legacy badge appears on exactly the pre-cutover sessions.
 
 ## Notes
 

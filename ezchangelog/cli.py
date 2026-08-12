@@ -932,22 +932,18 @@ def cmd_token(args: argparse.Namespace) -> int:
 
     try:
         if args.token_command == "mint":
-            minted = transport.mint_reader(args.name)
-            token = str(minted.get("token") or "")
-            _emit(
-                minted,
-                args.json,
-                [
-                    f"reader token for {args.name!r} — shown once, never again:",
-                    "",
-                    f"  {token}",
-                    "",
-                    f"grants: {minted.get('grants', 'read-only access to your sessions')}",
-                    "the operator uses it as EZUPDATE_TOKEN with the same store URL",
-                    f"revoke any time: ezup token revoke {args.name}",
-                ],
+            # Under E2E the reader secret is generated on the client and the
+            # minting device must also wrap every session's data key for the
+            # new reader (the O(sessions) grant backfill). That flow is not
+            # wired in the CLI yet, so refuse cleanly rather than call the
+            # server with a half-built request. Tracked for the next phase.
+            print(
+                "error: `ezup token mint` is being rebuilt for end-to-end "
+                "encryption (client-generated reader keys + data-key granting) "
+                "and is temporarily unavailable. See docs/E2E-CONTRACT.md.",
+                file=sys.stderr,
             )
-            return 0
+            return 2
         if args.token_command == "list":
             rows = transport.list_readers()
             lines = [f"{len(rows)} reader token(s) minted by this device"]
