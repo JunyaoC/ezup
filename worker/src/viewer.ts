@@ -546,26 +546,46 @@ function turnEl(turn) {
 function renderTranscript(log, text) {
   const turns = parseTurns(text);
   if (!turns.length) { log.appendChild($('<div class="empty">no user/assistant turns in this session</div>')); return; }
-  let shown = 0;
-  const sentinel = $('<div class="more">loading…</div>');
-  const drawPage = () => {
-    const end = Math.min(turns.length, shown + PAGE);
-    const frag = document.createElement("div");
-    frag.innerHTML = turns.slice(shown, end).map(turnEl).join("");
-    log.insertBefore(frag, sentinel);
-    while (frag.firstChild) log.insertBefore(frag.firstChild, sentinel);
-    frag.remove();
-    shown = end;
-    if (shown >= turns.length) { sentinel.remove(); obs.disconnect(); }
-    else sentinel.textContent = (turns.length - shown) + " more turn(s) — scroll to load";
-  };
+  const pane = reader();
+
+  // A chat reads newest-at-the-bottom: show the last page, scroll to the end,
+  // and load OLDER turns by scrolling up (reverse pagination). `start` is the
+  // index of the oldest turn currently rendered.
+  const sentinel = $('<div class="more"></div>');
   log.appendChild(sentinel);
-  // Lazy load: draw the next page whenever the sentinel scrolls into view.
+  let start = turns.length;
+
+  const prepend = () => {
+    if (start <= 0) return;
+    const from = Math.max(0, start - PAGE);
+    const before = pane.scrollHeight;
+    const frag = document.createElement("template");
+    frag.innerHTML = turns.slice(from, start).map(turnEl).join("");
+    // Insert the older block right after the top sentinel, in order.
+    const anchor = sentinel.nextSibling;
+    while (frag.content.firstChild) log.insertBefore(frag.content.firstChild, anchor);
+    start = from;
+    // Keep the reader visually still: the content that was on screen stays put.
+    pane.scrollTop += pane.scrollHeight - before;
+    if (start <= 0) { sentinel.remove(); obs.disconnect(); }
+    else sentinel.textContent = "▲ " + start + " earlier turn(s) — scroll up to load";
+  };
+
+  // First render: the last page, pinned to the bottom.
+  const from = Math.max(0, start - PAGE);
+  const frag = document.createElement("template");
+  frag.innerHTML = turns.slice(from, start).map(turnEl).join("");
+  while (frag.content.firstChild) log.appendChild(frag.content.firstChild);
+  start = from;
+  if (start > 0) sentinel.textContent = "▲ " + start + " earlier turn(s) — scroll up to load";
+  else sentinel.remove();
+  pane.scrollTop = pane.scrollHeight;    // open at the newest turn
+
+  // Load older turns when the top sentinel scrolls into view.
   const obs = new IntersectionObserver((entries) => {
-    if (entries.some(e => e.isIntersecting)) drawPage();
-  }, { root: reader(), rootMargin: "400px" });
-  drawPage();                 // first page immediately
-  obs.observe(sentinel);
+    if (entries.some(e => e.isIntersecting)) prepend();
+  }, { root: pane, rootMargin: "300px" });
+  if (start > 0) obs.observe(sentinel);
 }
 
 // --- Router: #s/<session> is the reading pane, empty hash is the list -----
