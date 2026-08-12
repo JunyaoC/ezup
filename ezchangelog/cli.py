@@ -23,7 +23,7 @@ from .crypto import (
     wrap_dk,
 )
 from .collect import CollectResult, Selection, collect, normalize_roots
-from .config import PullView, load_config, transport_for
+from .config import STORE_ENV, PullView, load_config, transport_for
 from .console import Console
 from .pipeline import STAGES as pipeline_stages_const, run_pipeline
 
@@ -34,7 +34,7 @@ from .publish import PublishState, publish as publish_session, readers_path
 from .pull import pull as pull_sessions, pulled_sessions
 from .store import Store, _write_json_atomic, default_store
 from .transcripts import CLAUDE_PROJECTS_DIR, SessionFacts, scan_transcript
-from .transport import HttpTransport, SessionMeta, TransportError
+from .transport import HttpTransport, SessionMeta, TransportError, register_device
 from .window import end_of_day, isoformat, since_to_datetime
 
 
@@ -1152,6 +1152,102 @@ def _mint_reader(
 # -- pull ---------------------------------------------------------------------
 
 
+def _admin_token(args: argparse.Namespace) -> str | None:
+    """The admin token, from --admin-token, $EZUP_ADMIN_TOKEN, or the admin file."""
+    if getattr(args, "admin_token", None):
+        return str(args.admin_token).strip()
+    env = os.environ.get("EZUP_ADMIN_TOKEN", "").strip()
+    if env:
+        return env
+    path = Path.home() / ".ezchangelog" / "admin-token"
+    if path.is_file():
+        return path.read_text(encoding="utf-8").strip()
+    return None
+
+
+def cmd_device(args: argparse.Namespace) -> int:
+    """Enrol a device (admin-gated). The device SECRET is generated here; the
+    server only ever receives its hash, so it can never publish or read as the
+    device it registers."""
+    store = _store_for(args)
+    config = load_config(store, os.getcwd())
+    base = config.store_url
+    if not base:
+        print(f"error: no store configured; set ${STORE_ENV} or a store in "
+              f"<store>/config.json", file=sys.stderr)
+        return 2
+    admin = _admin_token(args)
+    if not admin:
+        print("error: device minting is admin-gated; provide the admin token via "
+              "--admin-token, $EZUP_ADMIN_TOKEN, or ~/.ezchangelog/admin-token",
+              file=sys.stderr)
+        return 2
+
+    # Enrolling writes config.json. If this machine is already a device,
+    # overwriting it orphans every session that device owns (only the owning
+    # device may manage them), so refuse unless --force. Learned the hard way.
+    if args.token_command == "enroll" and config.token and not args.force:
+        print(
+            f"error: this machine is already enrolled as a device "
+            f"(author {config.author or '?'}). Enrolling again would orphan its "
+            f"sessions. Use `ezup device mint` to enrol someone else, or "
+            f"--force to replace this device anyway.",
+            file=sys.stderr,
+        )
+        return 2
+
+    email = args.email or f"{args.name}@ezup.local"
+    pasted, keyset = generate_key("device")
+    try:
+        resp = register_device(base, admin, args.name, email, bearer_sha256(pasted))
+    except TransportError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    device_id = str(resp.get("id"))
+
+    if args.token_command == "enroll":
+        # This machine becomes the device: write token + id into config.
+        cfg_path = store.root / "config.json"
+        cfg = {}
+        if cfg_path.is_file():
+            try:
+                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                cfg = {}
+        cfg.update({"store": base, "token": pasted, "device_id": device_id})
+        cfg.setdefault("author", args.name)
+        store.root.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+        cfg_path.chmod(0o600)
+        _emit(
+            {"device_id": device_id, "enrolled": True},
+            args.json,
+            [
+                f"enrolled this machine as device {device_id}",
+                f"config written to {cfg_path} (chmod 600)",
+                "you can now share your own sessions (ezup hook install; /ezup on)"
+                " and mint reader keys (ezup token mint).",
+            ],
+        )
+        return 0
+
+    # mint: register a device for SOMEONE ELSE; hand them the key + id.
+    _emit(
+        {"device_id": device_id, "token": pasted},
+        args.json,
+        [
+            f"device minted for {args.name!r} -- give them BOTH, shown once:",
+            "",
+            f"  token      {pasted}",
+            f"  device_id  {device_id}",
+            "",
+            f"they put these in their ~/.ezchangelog/config.json as \"token\" and "
+            f'"device_id" (store {base}). Treat the token like a password.',
+        ],
+    )
+    return 0
+
+
 def cmd_token(args: argparse.Namespace) -> int:
     """Reader-token management: a dev grants an operator read access."""
     store = _store_for(args)
@@ -1892,6 +1988,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="process one hook event from stdin (used by the Claude Code plugin)",
     )
     hook_run_parser.set_defaults(func=cmd_hook_run)
+
+    device_parser = subparsers.add_parser(
+        "device",
+        help="enrol a device so this machine can share and mint keys (admin-gated)",
+    )
+    device_sub = device_parser.add_subparsers(dest="token_command", required=True)
+    for verb, helptext in (
+        ("enroll", "enrol THIS machine as a device and write its config"),
+        ("mint", "mint a device for someone else and print its key + id"),
+    ):
+        dp = device_sub.add_parser(verb, help=helptext)
+        dp.add_argument("--name", required=True, help="who this device is for")
+        dp.add_argument("--email", help="optional; defaults to <name>@ezup.local")
+        dp.add_argument("--admin-token", help="admin token (else $EZUP_ADMIN_TOKEN "
+                        "or ~/.ezchangelog/admin-token)")
+        if verb == "enroll":
+            dp.add_argument("--force", action="store_true",
+                            help="replace an existing device config (orphans its sessions)")
+        dp.add_argument("--json", action="store_true")
+        dp.set_defaults(func=cmd_device, token_command=verb, force=False)
 
     token_parser = subparsers.add_parser(
         "token",
