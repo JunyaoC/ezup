@@ -549,7 +549,7 @@ function renderTranscript(log, text) {
   const pane = reader();
 
   // A chat reads newest-at-the-bottom: show the last page, scroll to the end,
-  // and load OLDER turns by scrolling up (reverse pagination). `start` is the
+  // and load OLDER turns by scrolling up (reverse pagination). start is the
   // index of the oldest turn currently rendered.
   const sentinel = $('<div class="more"></div>');
   log.appendChild(sentinel);
