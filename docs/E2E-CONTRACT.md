@@ -816,3 +816,21 @@ nobody mistakes the absence of paging for an oversight.
 "synthetic session under a PM key" idea is compatible with this contract
 (nothing here special-cases authorship) but is deliberately unspecified.
 Out of scope until the PM asks; do not build speculatively.
+
+## Known limitations (post-review, accepted)
+
+Two findings from the second adversarial review are accepted rather than fixed,
+because both fail closed (an error, never forged plaintext) and both are narrow:
+
+- **Mint racing compaction (review #2, LOW-MED).** If a reader is granted at the
+  instant a session compacts (R1 rotation), the reader's wrap can be stranded a
+  generation behind. A later publish self-heals it; a session that goes idle
+  right after the race leaves that reader unable to decrypt it (a permanent
+  generation mismatch — an error, never garbage). Re-minting the reader, or any
+  further activity on the session, resolves it.
+- **Wrap-withholding under legacy opt-in (review #3, LOW, by design).** A
+  malicious store can omit a session's wrap AND mark it plaintext; a client
+  cannot distinguish "never encrypted" from "encrypted, wrap withheld." Default
+  paths skip/lock it; only the explicit `--allow-legacy` / "show unverified
+  legacy" opt-in renders it, always badged unverified. This is the ceiling on
+  what "unverified legacy" promises — never trust a legacy badge as authentic.

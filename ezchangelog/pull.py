@@ -79,6 +79,14 @@ class PullReport:
     chunks: int = 0
     bytes: int = 0
     errors: list[str] = field(default_factory=list)
+    # Legacy plaintext sessions this caller holds no wrap for and did not pull
+    # (allow_legacy was off). Not errors: a deliberate default-safe skip, so
+    # the cursor is free to advance and the run still counts as ``ok``.
+    skipped: list[str] = field(default_factory=list)
+    # Legacy plaintext sessions pulled only because allow_legacy was on. Nothing
+    # cryptographic vouches for their bytes; the record carries the same flag so
+    # collect/journal can badge them "unverified plaintext".
+    unverified: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -404,6 +412,7 @@ def pull(
     since: str | None = None,
     authors: list[str] | None = None,
     keyid: str | None = None,
+    allow_legacy: bool = False,
 ) -> PullReport:
     """Fetch every session changed since the cursor and reassemble it locally.
 
@@ -411,6 +420,19 @@ def pull(
     the cursor from ``pull-state.json`` is used, so a re-run only pays for
     sessions that actually moved. ``keyid`` scopes the cursor to one keyring
     entry (see :func:`cursor_scope`); a developer's own pull passes None.
+
+    F1 (contract 6.4, hardened). A wrapped key the caller holds is
+    cryptographic proof a session is encrypted -- the store cannot forge one it
+    would accept. So on the E2E path this pull does *not* trust the session's
+    ``enc`` flag: it fetches the caller's whole wrap set up front and treats it,
+    not the flag, as ground truth. A session it holds a wrap for MUST arrive as
+    aead-v1; a plaintext presentation is a downgrade and is refused on the very
+    first pull, not only after a session has once been recorded encrypted. A
+    session it holds *no* wrap for is not readable on the E2E path: a legacy
+    plaintext one is pulled only when ``allow_legacy`` is set, and then recorded
+    and reported as "unverified". A non-E2E transport (a local directory, a raw
+    ``ezw_`` bearer, an old fake) has no wrap set and no key material, so it
+    keeps the plaintext-only behaviour it always had, ``allow_legacy`` or not.
     """
     report = PullReport()
     state = load_pull_state(store)
@@ -423,6 +445,26 @@ def pull(
     except Exception as exc:  # transport failures are reported, not raised
         report.errors.append(f"listing sessions failed: {exc}")
         return report
+
+    # The E2E path is exactly a transport that can both derive key material
+    # (key_set) and fetch wraps. On it, the wrap set is authoritative over the
+    # enc flag, so it is fetched once here -- if that fetch fails we cannot tell
+    # an honest plaintext session from a downgraded one, so we fail closed
+    # rather than fall back to trusting the flag.
+    key_set = getattr(transport, "key_set", None)
+    e2e = key_set is not None and getattr(transport, "get_wrapped_keys", None) is not None
+    wrapped_sessions: set[str] = set()
+    if e2e:
+        try:
+            held = transport.get_wrapped_keys(None)
+        except Exception as exc:
+            report.errors.append(f"fetching this key's wrapped keys failed: {exc}")
+            return report
+        wrapped_sessions = {
+            str(w.get("session"))
+            for w in (held or [])
+            if isinstance(w, dict) and w.get("session")
+        }
 
     wanted = {a for a in authors} if authors else None
     highest_ok: datetime | None = None
@@ -447,10 +489,35 @@ def pull(
         updated_at = parse_timestamp(row.get("updated_at")) or parse_timestamp(
             row.get("last_ts")
         )
-        before = len(report.errors)
         record = sessions_state.get(session)
+
+        enc = str(row.get("enc") or "")
+        held_wrap = session in wrapped_sessions
+        pinned_encrypted = (
+            isinstance(record, dict) and str(record.get("enc") or "") == ENC_SCHEME
+        )
+        # F1 legacy gate. On the E2E path a session we hold no wrap for is not
+        # readable: a plaintext legacy one is skipped unless the caller opts in.
+        # A held wrap (a downgrade if plaintext) and an already-pinned encrypted
+        # session (also a downgrade if plaintext) are deliberately excluded --
+        # those are judged in _pull_one so they raise, never silently skip.
+        if (
+            e2e
+            and enc != ENC_SCHEME
+            and not held_wrap
+            and not pinned_encrypted
+            and not allow_legacy
+        ):
+            report.skipped.append(
+                f"{author}/{session}: legacy plaintext, no wrapped key for this "
+                f"key -- skipped (pass allow_legacy to pull it as unverified)"
+            )
+            continue
+
+        before = len(report.errors)
         written, base, generation, pin = _pull_one(
-            transport, store, row, session, author, report, record
+            transport, store, row, session, author, report, record,
+            held_wrap=held_wrap, e2e=e2e,
         )
         # A partially written session is still incomplete even though the bytes
         # it did write are verified, so any error at all holds the cursor back.
@@ -510,6 +577,9 @@ def _session_record(
         "enc": str((pin or {}).get("enc") or ""),
         "enc_gen": int((pin or {}).get("enc_gen") or 0),
         "keyid": str((pin or {}).get("keyid") or ""),
+        # F1: a session pulled as legacy plaintext under allow_legacy. Nothing
+        # cryptographic vouches for it, so it is badged for anything reading it.
+        "unverified": bool((pin or {}).get("unverified")),
         "project": row.get("project"),
         "branch": row.get("branch"),
         "title": row.get("title"),
@@ -632,6 +702,9 @@ def _pull_one(
     author: str,
     report: PullReport,
     record: dict[str, Any] | None,
+    *,
+    held_wrap: bool = False,
+    e2e: bool = False,
 ) -> tuple[int | None, int, str, dict[str, Any]]:
     """Append this session's new bytes.
 
@@ -640,6 +713,10 @@ def _pull_one(
     starts at its opt-in watermark, so the leading gap ``[0, base)`` is the
     consent boundary, not missing data. Holes *between* chunks stay fatal.
     ``pin`` is the encryption state to record (see the downgrade pin below).
+
+    ``held_wrap`` is True when the caller holds a wrapped key for this session
+    (F1: proof it is encrypted); ``e2e`` is True when the transport is on the
+    E2E path at all. Both come from :func:`pull`, which owns the wrap set.
     """
     label = f"{author}/{session}"
     target = pulled_path_for(store, author, session)
@@ -660,6 +737,21 @@ def _pull_one(
         report.errors.append(
             f"{label}: this session was pulled encrypted but the store now "
             f"reports it as plaintext -- refusing (possible tampering)"
+        )
+        return None, 0, "", no_pin
+
+    # F1 first-use pin. The record pin above only fires once a session has
+    # already been recorded aead-v1 -- it cannot protect the very first pull,
+    # the trust-on-first-use hole. A wrapped key this caller holds closes it:
+    # the store cannot forge a wrap the caller's own K_enc would unwrap, so
+    # holding one is unforgeable proof the session is encrypted. If the store
+    # then presents it as plaintext, that is a downgrade attempt -- refuse
+    # before a single forged plaintext byte is appended, first pull or not.
+    if held_wrap and enc != ENC_SCHEME:
+        report.errors.append(
+            f"{label}: a wrapped key for this key proves this session is "
+            f"encrypted, but the store presents it as plaintext -- refusing "
+            f"(downgrade attempt)"
         )
         return None, 0, "", no_pin
 
@@ -693,7 +785,23 @@ def _pull_one(
                 f"{pinned_gen} was already pulled -- refusing (possible tampering)"
             )
             return None, 0, "", no_pin
-    pin = {"enc": enc, "enc_gen": gen, "keyid": keyid} if enc else no_pin
+
+    # A legacy plaintext session reached here only because the caller opted into
+    # legacy (pull() skips it otherwise) and we hold no wrap for it. Nothing
+    # cryptographic vouches for its bytes, so it is recorded and reported as
+    # unverified rather than silently trusted. Its record deliberately carries
+    # enc="" so it can never masquerade as a pinned encrypted session later.
+    unverified = e2e and enc != ENC_SCHEME and not held_wrap
+    if unverified:
+        report.unverified.append(
+            f"{label}: pulled as unverified plaintext (legacy, no wrapped key)"
+        )
+    if enc:
+        pin = {"enc": enc, "enc_gen": gen, "keyid": keyid, "unverified": False}
+    elif unverified:
+        pin = {"enc": "", "enc_gen": 0, "keyid": "", "unverified": True}
+    else:
+        pin = no_pin
 
     sealer: _Sealer | None = None
     if dk is not None:
@@ -853,6 +961,9 @@ def pulled_sessions(store: Store) -> list[dict[str, Any]]:
                 "reported_size": record.get("reported_size"),
                 "present": exists,
                 "pulled_at": record.get("pulled_at"),
+                # Legacy plaintext pulled under allow_legacy: no cryptographic
+                # provenance, so downstream renders it with a visible badge.
+                "unverified": bool(record.get("unverified")),
             }
         )
     rows.sort(key=lambda r: str(r.get("last_timestamp") or ""), reverse=True)

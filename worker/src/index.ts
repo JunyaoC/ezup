@@ -1187,8 +1187,14 @@ export default {
         return new Response(VIEWER_HTML, {
           headers: {
             "content-type": "text/html; charset=utf-8",
+            // base-uri/form-action 'none' are the second layer under esc()
+            // (review finding 4): even if an unescaped interpolation ever slips
+            // in, an injected script cannot exfiltrate the keyring by planting a
+            // <base> or auto-submitting a form to another origin. connect-src is
+            // already same-origin only.
             "content-security-policy":
-              "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'",
+              "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " +
+              "connect-src 'self'; base-uri 'none'; form-action 'none'",
             "x-content-type-options": "nosniff",
             "referrer-policy": "no-referrer",
           },
