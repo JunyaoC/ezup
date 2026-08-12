@@ -19,36 +19,32 @@ git clone https://github.com/JunyaoC/ezup && cd ezup
 your PATH. It also installs the one dependency (`cryptography`, for the E2E
 encryption).
 
-## 2. Point at the team store, and enrol as a device (once)
+## 2. Get a device credential (once)
 
-Set the store, then enrol. Enrolling needs the **admin token** (the store owner
-holds it — if the PM set up the Cloudflare store, that is them):
+The store is **already the default** (`https://ezupdate.nyf.workers.dev`) — no
+need to set it. You just need a device token. Two ways:
+
+**A — someone hands you one.** The store owner runs `ezup device mint --name pm`
+and sends you the printed `token` + `device_id`. You log in in one command:
 
 ```bash
-export EZUPDATE_STORE=https://ezupdate.nyf.workers.dev
+ezup login ezu_YOURTOKEN <device_id>
+```
 
-# store owner enrolling themselves (admin token in ~/.ezchangelog/admin-token
-# or $EZUP_ADMIN_TOKEN):
+**B — you own the store** (you set up the Cloudflare deployment, so you hold the
+admin token in `~/.ezchangelog/admin-token`):
+
+```bash
 ezup device enroll --name pm
-
-# OR the store owner enrols the PM remotely and hands them the printed key:
-#   ezup device mint --name pm         # prints token + device_id
-# the PM then writes those into ~/.ezchangelog/config.json as "token" and
-# "device_id" (with "store").
 ```
 
-`device enroll` generates the device key ON THIS MACHINE (the server only ever
-gets its hash) and writes `~/.ezchangelog/config.json` for you. It refuses to
-overwrite an existing device — use `--force` only if you mean to replace it
-(that orphans the old device's sessions).
+Both write `~/.ezchangelog/config.json` for you (chmod 600) and refuse to
+overwrite an existing device without `--force`. `device enroll` and `ezup login`
+never send the secret — the device key is generated locally and only its hash
+reaches the server.
 
-**Read-only PM instead?** Skip enrolment; just write the store URL:
-
-```bash
-mkdir -p ~/.ezchangelog
-echo '{ "store": "https://ezupdate.nyf.workers.dev", "author": "pm" }' \
-  > ~/.ezchangelog/config.json && chmod 600 ~/.ezchangelog/config.json
-```
+**Read-only PM?** Skip this entirely — the default store plus a keyring (below)
+is all you need.
 
 ## 2b. Share your own sessions (optional, if enrolled as a device)
 

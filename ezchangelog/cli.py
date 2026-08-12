@@ -23,7 +23,7 @@ from .crypto import (
     wrap_dk,
 )
 from .collect import CollectResult, Selection, collect, normalize_roots
-from .config import STORE_ENV, PullView, load_config, transport_for
+from .config import DEFAULT_STORE_URL, STORE_ENV, PullView, load_config, transport_for
 from .console import Console
 from .pipeline import STAGES as pipeline_stages_const, run_pipeline
 
@@ -1165,6 +1165,67 @@ def _admin_token(args: argparse.Namespace) -> str | None:
     return None
 
 
+def cmd_login(args: argparse.Namespace) -> int:
+    """Write this machine's credential in one step.
+
+    For the common case: someone was handed a device token + id (from
+    ``ezup device mint``) and just wants this machine configured. No hand-edited
+    JSON, no admin token. The store defaults to the team store.
+    """
+    store = _store_for(args)
+    token = args.token.strip()
+    try:
+        keyset = parse_key(token)
+    except CryptoError as error:
+        print(f"error: that does not look like a valid key: {error}", file=sys.stderr)
+        return 2
+    if keyset.kind != "device":
+        print("error: `ezup login` takes a device key (ezu_...). A reader key "
+              "(ezr_...) goes in the keyring: `ezup keyring add`.", file=sys.stderr)
+        return 2
+    if not args.device_id and not args.no_device_id:
+        print("error: a device token needs its device_id too (the uuid printed "
+              "beside it). Pass it as the second argument, or --no-device-id if "
+              "you only need read/publish without granting readers.",
+              file=sys.stderr)
+        return 2
+
+    existing = load_config(store, os.getcwd())
+    if existing.token and not args.force:
+        print(f"error: this machine already has a device token (author "
+              f"{existing.author or '?'}). Use --force to replace it (this "
+              f"orphans the old device's sessions).", file=sys.stderr)
+        return 2
+
+    cfg_path = store.root / "config.json"
+    cfg: dict[str, Any] = {}
+    if cfg_path.is_file():
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            cfg = {}
+    cfg["store"] = args.store or cfg.get("store") or DEFAULT_STORE_URL
+    cfg["token"] = token
+    if args.device_id:
+        cfg["device_id"] = args.device_id.strip()
+    if args.author:
+        cfg["author"] = args.author
+    store.root.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    cfg_path.chmod(0o600)
+    _emit(
+        {"store": cfg["store"], "device_id": cfg.get("device_id"), "configured": True},
+        args.json,
+        [
+            f"logged in to {cfg['store']}",
+            f"config written to {cfg_path} (chmod 600)",
+            "you can now share (ezup hook install; /ezup on) and, with a "
+            "device_id, mint reader keys (ezup token mint).",
+        ],
+    )
+    return 0
+
+
 def cmd_device(args: argparse.Namespace) -> int:
     """Enrol a device (admin-gated). The device SECRET is generated here; the
     server only ever receives its hash, so it can never publish or read as the
@@ -1988,6 +2049,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="process one hook event from stdin (used by the Claude Code plugin)",
     )
     hook_run_parser.set_defaults(func=cmd_hook_run)
+
+    login_parser = subparsers.add_parser(
+        "login",
+        help="configure this machine with a device token you were handed",
+    )
+    login_parser.add_argument("token", help="the ezu_... device token")
+    login_parser.add_argument("device_id", nargs="?", default="",
+                              help="the device uuid printed beside the token")
+    login_parser.add_argument("--store", help=f"store URL (default {DEFAULT_STORE_URL})")
+    login_parser.add_argument("--author", help="display name (default: git email)")
+    login_parser.add_argument("--no-device-id", action="store_true",
+                              help="skip the device_id (read/publish only, no minting)")
+    login_parser.add_argument("--force", action="store_true",
+                              help="replace an existing device (orphans its sessions)")
+    login_parser.add_argument("--json", action="store_true")
+    login_parser.set_defaults(func=cmd_login)
 
     device_parser = subparsers.add_parser(
         "device",

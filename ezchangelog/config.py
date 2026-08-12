@@ -46,6 +46,13 @@ TOKEN_ENV = "EZUPDATE_TOKEN"
 AUTHOR_ENV = "EZUPDATE_AUTHOR"
 DEVICE_ID_ENV = "EZUPDATE_DEVICE_ID"
 
+# The team's default store, so a fresh clone works with no configuration: every
+# command that needs a store falls back here when nothing else is set. Override
+# per machine with $EZUPDATE_STORE or a "store" key in <store>/config.json; a
+# fork running its own deployment changes this one line. It is a URL, never a
+# credential -- baking it in exposes nothing.
+DEFAULT_STORE_URL = "https://ezupdate.nyf.workers.dev"
+
 # transport.build_transport falls back to this one on its own; accepting it here
 # too means a machine configured for either name keeps working.
 LEGACY_TOKEN_ENV = "EZCHANGELOG_TOKEN"
@@ -217,6 +224,11 @@ def load_config(store: Store, cwd: str | Path | None = None) -> Config:
         return ""
 
     store_url = pick("store_url", STORE_ENV)
+    if not store_url:
+        # Nothing configured anywhere: use the team default so a fresh clone
+        # points somewhere real instead of erroring "not configured".
+        store_url = DEFAULT_STORE_URL
+        origins["store_url"] = "default"
     token = pick("token", TOKEN_ENV, LEGACY_TOKEN_ENV)
     author = pick("author", AUTHOR_ENV)
     if not author:
