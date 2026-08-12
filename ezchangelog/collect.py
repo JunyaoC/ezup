@@ -392,7 +392,11 @@ def collect(
             refresh=refresh,
         )
 
+    # Newest first, then cluster by author so a mixed local+pulled list groups
+    # each person's sessions together (a stable sort keeps the date order within
+    # each author). Local sessions have no author and sort as one group.
     result.selected.sort(key=lambda s: s.last_active, reverse=True)
+    result.selected.sort(key=lambda s: (s.author or "").lower())
 
     # Let the caller narrow the selection before anything is written.
     if chooser is not None:

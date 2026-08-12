@@ -1664,8 +1664,11 @@ def _journal_after_pull(args: argparse.Namespace, store: Store) -> int:
         window = f"{window}d"        # bare "14" means 14 days
     elif window.lower() == "all":
         window = "2020-01-01"        # everything ezup could plausibly hold
-    # Reuse the collect+pipeline path with a constructed namespace: pull over the
-    # pulled sessions for the window, take them all, no picker.
+    # On a terminal, let the PM pick which sessions to journal (grouped by
+    # author in the picker); headless (a pipe, a cron), take them all.
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    # Reuse the collect+pipeline path with a constructed namespace: collect over
+    # the pulled sessions for the window.
     collect_args = argparse.Namespace(
         directories=[],
         since=window,
@@ -1674,8 +1677,8 @@ def _journal_after_pull(args: argparse.Namespace, store: Store) -> int:
         match="any",
         min_turns=1,
         min_tools=1,
-        interactive=False,
-        yes=True,
+        interactive=interactive,
+        yes=not interactive,
         dry_run=False,
         stop_before_model=False,
         refresh=False,
