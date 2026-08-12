@@ -1,8 +1,17 @@
-"""Stateless model calls via ``claude -p``.
+"""Stateless model calls, facade over a resolved provider.
 
-Every call is a fresh headless session: no ``--continue``, no ``--resume``, no
-shared state. The prompt goes in on stdin, the answer comes back on stdout, and
-nothing survives the process. Output streams to the console as it arrives.
+Every call is a fresh session: no ``--continue``, no ``--resume``, no shared
+state. The prompt goes in, the answer comes back, and nothing survives the
+call. Output streams to the console as it arrives.
+
+This module stays the pipeline's single entry point -- ``run``, ``Reply``,
+``MECHANICAL``/``SYNTHESIS``, ``extract_json``, ``LLMError`` -- so
+``pipeline.py`` never learns which backend answered. ``run`` maps the pipeline's
+(model, effort) request to a tier and dispatches to the provider chosen by
+:func:`ezchangelog.llm_providers.resolve_provider`. With no environment set that
+provider is the historical `claude -p` path, so nothing changes for existing
+users; setting ``EZUP_LLM_BASE_URL`` + a key switches the whole pipeline to an
+OpenAI-compatible HTTP endpoint.
 
 Two tiers, per the pipeline's split between mechanical and judgment work:
 
@@ -13,14 +22,16 @@ Two tiers, per the pipeline's split between mechanical and judgment work:
 from __future__ import annotations
 
 import json
-import shutil
-import subprocess
-import sys
 from dataclasses import dataclass
 from typing import Callable
 
 MECHANICAL = ("sonnet", "low")
 SYNTHESIS = ("opus", "max")
+
+# Reverse of the tier -> (model, effort) map. The pipeline still requests work
+# by (model, effort); the provider seam speaks tiers. Resolving here keeps the
+# CLI vocabulary (opus/max) from ever reaching an HTTP backend.
+_TIER_FOR = {MECHANICAL: "mechanical", SYNTHESIS: "synthesis"}
 
 
 class LLMError(RuntimeError):
@@ -41,7 +52,13 @@ class Reply:
 
 
 def available() -> bool:
-    return shutil.which("claude") is not None
+    """Whether the resolved provider is usable (CLI on PATH, or HTTP configured)."""
+    # Imported lazily so importing llm.py never triggers llm_providers at module
+    # load time -- llm_providers imports Reply/LLMError back from here, and the
+    # lazy call breaks what would otherwise be an import cycle.
+    from ezchangelog.llm_providers import resolve_provider
+
+    return resolve_provider().available()
 
 
 def run(
@@ -53,84 +70,25 @@ def run(
     on_text: Callable[[str], None] | None = None,
     cwd: str | None = None,
 ) -> Reply:
-    """Run one stateless prompt. Streams deltas to ``on_text`` as they arrive."""
-    if not available():
-        raise LLMError("the `claude` CLI is not on PATH")
+    """Run one stateless prompt. Streams deltas to ``on_text`` as they arrive.
 
-    command = [
-        "claude",
-        "-p",
-        "--model", model,
-        "--effort", effort,
-        # No MCP servers: they add tool definitions to every request and this
-        # call needs no tools at all.
-        "--strict-mcp-config",
-        "--output-format", "stream-json",
-        "--include-partial-messages",
-        "--verbose",
-    ]
-    if system:
-        command += ["--system-prompt", system]
+    Signature is unchanged so ``pipeline.py`` does not move. The (model, effort)
+    pair is translated to a tier here and handed to the resolved provider; the
+    provider owns the mapping back to a concrete backend request.
+    """
+    from ezchangelog.llm_providers import resolve_provider
 
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
+    # Unknown (model, effort) pairs should never reach here -- the pipeline only
+    # ever passes MECHANICAL or SYNTHESIS -- but default to the cheap tier rather
+    # than crash, so a stray call degrades instead of failing the journal.
+    tier = _TIER_FOR.get((model, effort), "mechanical")
+    return resolve_provider().run(
+        prompt,
+        tier=tier,
+        system=system,
+        on_text=on_text,
         cwd=cwd,
     )
-    assert process.stdin and process.stdout
-    try:
-        process.stdin.write(prompt)
-        process.stdin.close()
-    except BrokenPipeError as error:
-        raise LLMError(f"claude closed stdin early: {error}") from error
-
-    chunks: list[str] = []
-    reply = Reply(text="")
-
-    for line in process.stdout:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
-        kind = event.get("type")
-        if kind == "stream_event":
-            inner = event.get("event", {})
-            if inner.get("type") == "content_block_delta":
-                piece = inner.get("delta", {}).get("text", "")
-                if piece:
-                    chunks.append(piece)
-                    if on_text:
-                        on_text(piece)
-        elif kind == "result":
-            usage = event.get("usage") or {}
-            reply.cost_usd = float(event.get("total_cost_usd") or 0.0)
-            reply.duration_ms = int(event.get("duration_api_ms") or 0)
-            reply.input_tokens = int(usage.get("input_tokens") or 0) + int(
-                usage.get("cache_read_input_tokens") or 0
-            ) + int(usage.get("cache_creation_input_tokens") or 0)
-            reply.output_tokens = int(usage.get("output_tokens") or 0)
-            if event.get("is_error"):
-                raise LLMError(str(event.get("result", "claude reported an error")))
-            if not chunks and isinstance(event.get("result"), str):
-                chunks.append(event["result"])
-
-    stderr = process.stderr.read() if process.stderr else ""
-    code = process.wait()
-    if code != 0:
-        raise LLMError(f"claude exited {code}: {stderr.strip()[:400]}")
-
-    reply.text = "".join(chunks)
-    if not reply.text.strip():
-        raise LLMError("claude returned an empty response")
-    return reply
 
 
 def extract_json(text: str) -> object:

@@ -1,0 +1,61 @@
+# Scheduled ezup runner on GitHub Actions.
+#
+# Copy this to .github/workflows/ezup-runner.yml in a repository the PM
+# controls. GitHub-hosted runners are ephemeral compute the PM's account owns,
+# which satisfies the trust boundary (REMOTE-RUNNER-DESIGN section 1): the
+# keyring and LLM key live only in this repo's Actions secrets, and the
+# plaintext journal is uploaded only to the PM's own bucket.
+#
+# NOTE: a GitHub-hosted runner has no persistent /data volume between runs, so
+# `ezup pull` re-fetches its window each time (correct, just not incremental).
+# For an incremental cache, add actions/cache on /data or use a self-hosted
+# runner on a box the PM controls.
+#
+# Configure these repository secrets (Settings -> Secrets and variables ->
+# Actions):
+#   EZUP_KEYRING          the reader keys, one "ezr_..." per line
+#   EZUP_LLM_API_KEY      the provider bearer token
+#   AWS_ACCESS_KEY_ID     the PM bucket's access key
+#   AWS_SECRET_ACCESS_KEY the PM bucket's secret key
+name: ezup-journal
+
+on:
+  schedule:
+    # 06:00 UTC every Monday. cron is UTC on GitHub; adjust for the team's TZ.
+    - cron: "0 6 * * 1"
+  workflow_dispatch: {}   # allow a manual run from the Actions tab
+
+jobs:
+  journal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build runner image
+        run: docker build -f runner/Dockerfile -t ezup-runner .
+
+      - name: Run pipeline and upload journal
+        env:
+          EZUPDATE_STORE: https://ezupdate.nyf.workers.dev
+          EZUP_KEYRING: ${{ secrets.EZUP_KEYRING }}
+          EZUP_LLM_PROVIDER: http
+          EZUP_LLM_BASE_URL: https://api.minimax.io/v1
+          EZUP_LLM_API_KEY: ${{ secrets.EZUP_LLM_API_KEY }}
+          EZUP_LLM_MODEL_MECHANICAL: MiniMax-Text-01
+          EZUP_LLM_MODEL_SYNTHESIS: MiniMax-M1
+          EZUP_COLLECT_WINDOW: all
+          S3_BUCKET: my-team-journals
+          S3_ENDPOINT: https://<accountid>.r2.cloudflarestorage.com
+          S3_PREFIX: journals
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          docker run --rm \
+            -e EZUPDATE_STORE -e EZUP_KEYRING \
+            -e EZUP_LLM_PROVIDER -e EZUP_LLM_BASE_URL -e EZUP_LLM_API_KEY \
+            -e EZUP_LLM_MODEL_MECHANICAL -e EZUP_LLM_MODEL_SYNTHESIS \
+            -e EZUP_COLLECT_WINDOW \
+            -e S3_BUCKET -e S3_ENDPOINT -e S3_PREFIX \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
+            -v ${{ github.workspace }}/data:/data \
+            ezup-runner

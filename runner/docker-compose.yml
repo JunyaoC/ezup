@@ -1,0 +1,43 @@
+# A one-shot run of the ezup runner, wired to file-mounted secrets.
+#
+#   docker compose -f runner/docker-compose.yml run --rm runner
+#
+# This composes a single batch job, not a long-running service (the runner has
+# no daemon and no port). To SCHEDULE it, drive this same command from the
+# host's cron -- see runner/README.md ("Scheduling").
+#
+# Secrets are mounted read-only as files and referenced by their *_FILE env
+# vars, so they never appear in `docker inspect` output.
+services:
+  runner:
+    build:
+      # Build context is the repo root; the Dockerfile lives under runner/.
+      context: ..
+      dockerfile: runner/Dockerfile
+    image: ezup-runner
+    # The trust-domain volume: decrypted transcripts + rendered journals.
+    # Encrypt the host path at rest with platform disk encryption.
+    volumes:
+      - ./data:/data
+      - ./secrets:/run/secrets:ro
+    environment:
+      # -- store ----------------------------------------------------------
+      EZUPDATE_STORE: https://ezupdate.nyf.workers.dev
+      EZCHANGELOG_HOME: /data
+      # The keyring reader keys, mounted as a file (one ezr_ key per line).
+      EZUP_KEYRING_FILE: /run/secrets/keyring.keys
+      # -- HTTP LLM provider (MiniMax shown; see README) ------------------
+      EZUP_LLM_PROVIDER: http
+      EZUP_LLM_BASE_URL: https://api.minimax.io/v1
+      EZUP_LLM_API_KEY_FILE: /run/secrets/llm_api_key
+      EZUP_LLM_MODEL_MECHANICAL: MiniMax-Text-01
+      EZUP_LLM_MODEL_SYNTHESIS: MiniMax-M1
+      # -- collect window -------------------------------------------------
+      EZUP_COLLECT_WINDOW: all
+      # -- the PM's OWN bucket (R2 shown) ---------------------------------
+      S3_BUCKET: my-team-journals
+      S3_ENDPOINT: https://<accountid>.r2.cloudflarestorage.com
+      S3_PREFIX: journals
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+    restart: "no"

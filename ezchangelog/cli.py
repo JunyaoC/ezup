@@ -220,7 +220,14 @@ def _print_result(
 
 def cmd_collect(args: argparse.Namespace) -> int:
     store = Store(Path(args.store).expanduser() if args.store else default_store())
-    roots = normalize_roots(args.directories)
+    # `collect all` is the runner's spelling of "every project": a single bare
+    # `all` positional is not a directory to resolve but a request to drop the
+    # directory filter entirely, mirroring `sync all`. A real directory list --
+    # even one that happens to contain other names -- is left untouched.
+    directories = args.directories
+    if [d.strip().lower() for d in directories] == ["all"]:
+        directories = []
+    roots = normalize_roots(directories)
     missing = [str(root) for root in roots if not root.is_dir()]
     if missing:
         print(f"warning: directory does not exist: {', '.join(missing)}", file=sys.stderr)
@@ -237,6 +244,17 @@ def cmd_collect(args: argparse.Namespace) -> int:
         print("error: --since resolves after --until", file=sys.stderr)
         return 2
 
+    # --yes forces the chooser-less path: every matched session proceeds, with
+    # no picker and no prompt, so the runner works with no TTY. It wins over -i
+    # if both are given. When --yes is absent nothing here changes -- the picker
+    # is used only with -i, exactly as before.
+    if args.yes:
+        chooser = None
+    elif args.interactive:
+        chooser = interactive_chooser
+    else:
+        chooser = None
+
     result = collect(
         roots,
         since,
@@ -249,22 +267,42 @@ def cmd_collect(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         refresh=args.refresh,
         include_pulled=args.include_pulled,
-        chooser=interactive_chooser if args.interactive else None,
+        chooser=chooser,
     )
 
-    if args.json:
-        json.dump(result.manifest(), sys.stdout, indent=2)
-        sys.stdout.write("\n")
-        return 0
-
     will_journal = not (args.no_journal or args.dry_run) and result.selected
-    # The picker already showed the sessions; reprinting the whole table before
-    # the pipeline just pushes the interesting part off screen.
-    if not (will_journal and args.interactive):
-        _print_result(result, store, args.dry_run, args.limit)
 
+    # Headless refusal: a --yes run that would have journaled but matched nothing
+    # fails loudly. For an unattended runner an empty selection almost always
+    # means a broken pull, not a quiet week, and silently emitting no journal
+    # would hide that. An explicit --dry-run / --no-journal --yes is a report,
+    # not a journaling run, so it is exempt.
+    if args.yes and not result.selected and not (args.no_journal or args.dry_run):
+        message = "no sessions matched the window; refusing to build an empty journal"
+        if args.json:
+            json.dump({"error": message, **result.manifest()}, sys.stdout, indent=2)
+            sys.stdout.write("\n")
+        else:
+            print(f"error: {message}", file=sys.stderr)
+        return 4
+
+    # Not journaling: emit the selection exactly as before -- the manifest under
+    # --json, the human table otherwise. The journal path is added after the
+    # pipeline (below), so a --json caller that DOES journal gets it in the same
+    # object rather than losing it to this early return.
     if not will_journal:
+        if args.json:
+            json.dump(result.manifest(), sys.stdout, indent=2)
+            sys.stdout.write("\n")
+        else:
+            _print_result(result, store, args.dry_run, args.limit)
         return 0
+
+    # The picker already showed the sessions; reprinting the whole table before
+    # the pipeline just pushes the interesting part off screen. Under --json the
+    # only stdout output is the machine-readable object emitted after the run.
+    if not args.json and not args.interactive:
+        _print_result(result, store, args.dry_run, args.limit)
 
     console = Console(verbose=not args.quiet, stages=pipeline_stages())
     # display_dir may be "~/Documents/lab/foo" in all-projects mode, so the
@@ -299,7 +337,18 @@ def cmd_collect(args: argparse.Namespace) -> int:
         raise
     if journal is None:
         console.abort()
+        if args.json:
+            json.dump({"journal": None, **result.manifest()}, sys.stdout, indent=2)
+            sys.stdout.write("\n")
         return 1
+
+    # Announce where the journal landed so a script (or a person) can find it
+    # without scraping the pipeline's progress output. The runner reads this.
+    if args.json:
+        json.dump({"journal": str(journal), **result.manifest()}, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    else:
+        print(f"journal  {journal}")
     return 0
 
 
@@ -1635,6 +1684,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--interactive",
         action="store_true",
         help="list the window's sessions and pick which ones to keep",
+    )
+    collect_parser.add_argument(
+        "-y",
+        "--yes",
+        "--all",
+        dest="yes",
+        action="store_true",
+        help=(
+            "headless: take every matched session in the window without a "
+            "picker and journal them straight through. Needs no TTY. Refuses "
+            "with a non-zero exit when nothing matches, so an unattended runner "
+            "surfaces a broken pull instead of emitting an empty journal."
+        ),
     )
     collect_parser.add_argument(
         "--match",
