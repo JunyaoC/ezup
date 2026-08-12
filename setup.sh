@@ -93,17 +93,68 @@ else
   warn "no transcripts at $TRANSCRIPTS yet"
 fi
 
+# -- 6. team sharing (interactive) -------------------------------------------
+# Only when a person is watching. Skip with --no-enroll or in a non-TTY (CI).
+EZUP="$HERE/.venv/bin/ezup"
+already_enrolled() { "$EZUP" token show >/dev/null 2>&1; }
+
+if [ "${1:-}" = "--no-enroll" ] || [ ! -t 0 ]; then
+  step "team sharing"
+  ok "skipped (non-interactive). Enrol later: ezup device enroll --name YOU"
+else
+  step "team sharing"
+  if already_enrolled; then
+    ok "this machine is already enrolled — leaving it as is"
+  else
+    printf '  Enrol this machine to share your Claude sessions with the team? [Y/n] '
+    read -r ans
+    case "$ans" in
+      [nN]*) ok "skipped. Enrol later: ezup device enroll --name YOU" ;;
+      *)
+        default_name="$(git config user.name 2>/dev/null | tr ' ' '-' | tr 'A-Z' 'a-z')"
+        [ -n "$default_name" ] || default_name="${USER:-me}"
+        printf '  Your name for the team [%s]: ' "$default_name"
+        read -r name
+        [ -n "$name" ] || name="$default_name"
+
+        if "$EZUP" device enroll --name "$name"; then
+          ok "enrolled as $name"
+          # install the recording hook so /ezup on works
+          if "$EZUP" hook install >/dev/null 2>&1; then
+            ok "recording hook installed (share a session with /ezup on)"
+          else
+            warn "could not install the hook; run: ezup hook install"
+          fi
+
+          # offer to mint a read key for the PM/manager
+          printf '  Mint a read-only key to give your manager/PM? [Y/n] '
+          read -r want
+          case "$want" in
+            [nN]*) ok "skipped. Mint later: ezup token mint --name pm" ;;
+            *)
+              printf '  Who is it for [pm]: '
+              read -r pm
+              [ -n "$pm" ] || pm="pm"
+              echo
+              "$EZUP" token mint --name "$pm" || \
+                warn "mint failed; try later: ezup token mint --name $pm"
+              ;;
+          esac
+        else
+          warn "enrolment failed (store may be admin-gated). Ask the store owner"
+          warn "to run: ezup device mint --name $name -- then: ezup login <token> <id>"
+        fi
+        ;;
+    esac
+  fi
+fi
+
 cat <<'DONE'
 
-Ready. Start with:
+Ready.
 
-  ./collect              every project, last 7 days
-  ./collect 30d          every project, last 30 days
-  ./collect ~/code/proj  one project, last 7 days
-
-The ./collect script uses .venv automatically. To get `ezcl` on your PATH
-in this shell instead:
-
-  source .venv/bin/activate
+  Share a session:   open Claude Code, then  /ezup on   (/ezup off to stop)
+  Read the team:     ezup keyring add ezr_...  then  ezup pull
+  Make a journal:    ./collect 7d              (or: ezup pull, for teammates)
 
 DONE
