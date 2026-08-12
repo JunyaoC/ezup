@@ -89,7 +89,11 @@ class BadInputTests(HookEntryTestCase):
         self.assertSilent(self.run_hook(self.payload("PreCompact")))
 
     def test_statusline_with_malformed_json_exits_zero(self) -> None:
-        self.assertSilent(self.run_hook("{ nope", "statusline"))
+        # Malformed input degrades to an empty payload, which resolves to the
+        # idle indicator -- never a crash, never sharing.
+        done = self.run_hook("{ nope", "statusline")
+        self.assertEqual(0, done.returncode)
+        self.assertNotIn("REC", done.stdout)
 
 
 class SharingOffTests(HookEntryTestCase):
@@ -107,8 +111,14 @@ class SharingOffTests(HookEntryTestCase):
         self.assertFalse((self.store_root / "publish").exists())
         self.assertFalse((self.store_root / "logs").exists())
 
-    def test_statusline_is_empty_when_sharing_is_off(self) -> None:
-        self.assertSilent(self.run_hook(self.payload("Stop"), "statusline"))
+    def test_statusline_shows_idle_when_sharing_is_off(self) -> None:
+        # The statusline is the one deliberate exception to "off is silent":
+        # a persistent indicator that also answers "is ezup even installed?".
+        # Hook events themselves stay silent (the tests above).
+        done = self.run_hook(self.payload("Stop"), "statusline")
+        self.assertEqual(0, done.returncode)
+        self.assertIn("ezup off", done.stdout)
+        self.assertNotIn("REC", done.stdout)
 
     def test_an_explicit_off_marker_is_still_silent(self) -> None:
         share.set_session(SESSION, False, self.store, cwd=self.work)
@@ -137,7 +147,7 @@ class SharingOnTests(HookEntryTestCase):
 
         self.assertEqual(0, done.returncode, done.stderr)
         self.assertIn("ezup", done.stdout)
-        self.assertIn("sharing", done.stdout)
+        self.assertIn("REC", done.stdout)
 
 
 class BrokenStoreTests(HookEntryTestCase):

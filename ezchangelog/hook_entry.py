@@ -139,15 +139,31 @@ def _announce(decision: "Decision", cwd: str) -> str:
 
 
 def statusline(payload: dict[str, Any]) -> str:
-    """The persistent indicator. Empty string when sharing is off."""
+    """The persistent indicator, always visible once installed.
+
+    Red dot while the transcript is being shared -- the recording-light
+    metaphor is the honest one -- and a dim idle line otherwise, so a glance
+    also answers "is ezup even installed?". Claude Code renders ANSI here.
+    """
+    dim = "\033[2m"
+    red = "\033[1;31m"
+    reset = "\033[0m"
     try:
-        from .share import project_name, resolve
+        from .share import project_name, resolve, store_url
 
         store, session_id, cwd = _context(payload)
         decision = resolve(session_id, cwd, store)
         if not decision.sharing:
-            return ""
-        return f"up ezup · {project_name(cwd)} · sharing"
+            return f"{dim}⚪ ezup off{reset}"
+        target = store_url(decision) or ""
+        if not target:
+            # A session-level opt-in carries no store of its own; the machine
+            # config is where the bytes actually go.
+            from .config import load_config
+
+            target = load_config(store, cwd).store_url
+        host = target.split("//")[-1].split("/")[0] if target else "team store"
+        return f"{red}🔴 ezup REC{reset} {dim}· {project_name(cwd)} → {host}{reset}"
     except Exception:
         return ""
 

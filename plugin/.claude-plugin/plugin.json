@@ -1,7 +1,7 @@
 {
   "name": "ezup",
   "description": "Consent-gated session sharing for teams: opt a session in with /ezup on, and its transcript syncs incrementally to your team store for the PM to journal. Off by default; installing shares nothing.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": {
     "name": "JunyaoC",
     "url": "https://github.com/JunyaoC/ezup"

@@ -49,7 +49,7 @@ class RepoPolicyTests(TempHomeTestCase):
         decision = share.resolve("sess-1", repo, self.store)
         self.assertFalse(decision.sharing)
         self.assertEqual("repo", decision.source)
-        self.assertIn("ezcl share on", decision.reason)
+        self.assertIn("ezup share on", decision.reason)
 
     def test_never_is_off(self) -> None:
         repo = self.make_repo("locked", share="never")
@@ -63,7 +63,7 @@ class RepoPolicyTests(TempHomeTestCase):
         before = share.resolve("sess-1", repo, self.store)
         self.assertFalse(before.sharing, "a committed policy alone must not share")
         self.assertEqual("repo", before.source)
-        self.assertIn("ezcl share ack", before.reason)
+        self.assertIn("ezup share ack", before.reason)
 
         share.acknowledge(repo, self.store)
 

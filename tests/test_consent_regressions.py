@@ -288,7 +288,7 @@ class SyncRefusalTests(TempHomeTestCase):
         refusal = cli._sync_refusal(self.store, SESSION, str(work))
 
         self.assertTrue(refusal, "an explicit off must block sync")
-        self.assertIn("ezcl share off", refusal)
+        self.assertIn("ezup share off", refusal)
 
     def test_sync_may_offer_an_undecided_session(self) -> None:
         # The control: sync IS the consent step for sessions nobody decided

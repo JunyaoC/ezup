@@ -410,7 +410,7 @@ def _sync_refusal(store: Store, session_id: str, cwd: str) -> str:
     `sync` is itself a consent step, so the states that mean "nobody has decided
     yet" -- a repo that says ``ask``, or no policy at all -- are exactly what it
     exists to offer. A decision that *was* already made is a different thing: an
-    explicit `ezcl share off`, a repo-level ``never``, or a resolution that
+    explicit `ezup share off`, a repo-level ``never``, or a resolution that
     failed outright must not be undone by one keystroke in a picker.
     """
     decision = share.resolve(session_id, cwd, store)
@@ -459,7 +459,7 @@ def cmd_hook(args: argparse.Namespace) -> int:
         lines.append("")
         lines.append(
             "installed, and sharing is still OFF. Nothing leaves this machine "
-            "until you run `ezcl share on`."
+            "until you run `ezup share on`."
         )
     _emit(info, args.json, lines)
     return 0
@@ -490,7 +490,9 @@ def _share_status(store: Store, session_id: str | None, cwd: str, as_json: bool)
         f"sharing   {decision.state}",
         f"why       {decision.reason}",
         *config.describe(),
-        f"published {_human(state.offset)}"
+        # offset is where publishing has reached in the document; what actually
+        # left the machine is only the part above the consent watermark.
+        f"published {_human(max(0, state.offset - state.start_offset))}"
         + (f" (last {state.last_published})" if state.last_published else ""),
     ]
     _emit(payload, as_json, lines)
@@ -514,7 +516,7 @@ def _ack_policy(
             f"error: no .ez/config.json at or above {cwd} declares a \"share\" "
             f"policy, so there is nothing to acknowledge. `share ack` accepts a "
             f"repo's committed policy; to share just this session run "
-            f"`ezcl share on`.",
+            f"`ezup share on`.",
             file=sys.stderr,
         )
         return 2
@@ -525,7 +527,7 @@ def _ack_policy(
             + (
                 " -- sessions under it are never shared."
                 if policy.mode == "never"
-                else " -- run `ezcl share on` per session instead."
+                else " -- run `ezup share on` per session instead."
             ),
             file=sys.stderr,
         )
@@ -549,7 +551,7 @@ def _ack_policy(
     say(
         f"acknowledged on this machine ({path}). This accepts the file exactly "
         f"as printed above: if any of it changes, sharing reverts to off until "
-        f"you run `ezcl share ack` again."
+        f"you run `ezup share ack` again."
     )
     return _share_status(store, session_id, cwd, as_json)
 
@@ -627,18 +629,18 @@ def cmd_share(args: argparse.Namespace) -> int:
             f"transcript of this session is uploaded to "
             f"{config.store_url or 'the store (not configured yet)'}, including "
             f"everything you type and everything tools print. Run "
-            f"`ezcl share off` to stop."
+            f"`ezup share off` to stop."
         )
         if watermark:
             say(
                 f"the {_human(watermark)} of this session recorded before now "
                 f"stays on this machine: publishing starts at byte {watermark}. "
-                f"Run `ezcl sync` if you do want the earlier part shared too."
+                f"Run `ezup sync` if you do want the earlier part shared too."
             )
         elif PublishState.load(store, session_id).published:
             say(
                 "this session has published before, so sharing resumes where it "
-                "left off; `ezcl unpublish` removes what is already up there."
+                "left off; `ezup unpublish` removes what is already up there."
             )
         else:
             say("nothing was recorded before now, so nothing earlier exists to send.")
@@ -646,7 +648,7 @@ def cmd_share(args: argparse.Namespace) -> int:
         say(
             f"sharing OFF for session {session_id}: no further bytes leave this "
             f"machine. Anything already published stays until you run "
-            f"`ezcl unpublish --session {session_id}`."
+            f"`ezup unpublish --session {session_id}`."
         )
     return _share_status(store, session_id, cwd, args.json)
 

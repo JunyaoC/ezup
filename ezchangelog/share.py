@@ -2,12 +2,12 @@
 
 Three levels, first match wins::
 
-    1. <store>/sessions/<session-id>.share   "on" | "off"   -- set by `ezcl share`
+    1. <store>/sessions/<session-id>.share   "on" | "off"   -- set by `ezup share`
     2. <repo>/.ez/config.json  "share"       always | ask | never
     3. built-in default                                     -- off
 
 The default is off and installing the hook changes nothing here: sharing only
-ever starts because a person ran `ezcl share on`, or because a repo committed a
+ever starts because a person ran `ezup share on`, or because a repo committed a
 policy that this machine then acknowledged. ``always`` needs that one-time
 acknowledgement because a committed config file must not be able to switch on
 sharing for a teammate who merely cloned the repo -- which is precisely the
@@ -411,7 +411,7 @@ def _resolve(session_id: str | None, cwd: str | Path | None, store: Store) -> De
     marker = read_session(store, session_id or "")
     if marker == "on":
         # The one place the ordering bends: `never` is documented as a hard off
-        # and `ezcl share on` refuses to write this marker, so an "on" marker
+        # and `ezup share on` refuses to write this marker, so an "on" marker
         # under `never` can only be a stale file or a hand edit. Honouring it
         # would make the repo's strongest setting the easiest one to defeat.
         if mode == "never":
@@ -425,14 +425,14 @@ def _resolve(session_id: str | None, cwd: str | Path | None, store: Store) -> De
             )
         return Decision(
             True,
-            "on — you turned sharing on for this session with `ezcl share on`",
+            "on — you turned sharing on for this session with `ezup share on`",
             "session",
             config,
         )
     if marker == "off":
         return Decision(
             False,
-            "off — you turned sharing off for this session with `ezcl share off`",
+            "off — you turned sharing off for this session with `ezup share off`",
             "session",
             config,
         )
@@ -443,7 +443,7 @@ def _resolve(session_id: str | None, cwd: str | Path | None, store: Store) -> De
             return Decision(
                 True,
                 f"on — {where} says always, and this machine acknowledged that "
-                f"exact policy{override}; run `ezcl share off` to opt this "
+                f"exact policy{override}; run `ezup share off` to opt this "
                 f"session out",
                 "repo",
                 config,
@@ -457,16 +457,16 @@ def _resolve(session_id: str | None, cwd: str | Path | None, store: Store) -> De
                 False,
                 f"off — {where} says always, but its contents changed since this "
                 f"machine acknowledged them, so the acknowledgement is void; "
-                f"review the file and run `ezcl share ack` to accept the new "
-                f"policy, or `ezcl share on` for just this session",
+                f"review the file and run `ezup share ack` to accept the new "
+                f"policy, or `ezup share on` for just this session",
                 "repo",
                 config,
             )
         return Decision(
             False,
             f"off — {where} says always, but this machine has not acknowledged "
-            f"that policy yet; run `ezcl share ack` to accept it, or "
-            f"`ezcl share on` for just this session",
+            f"that policy yet; run `ezup share ack` to accept it, or "
+            f"`ezup share on` for just this session",
             "repo",
             config,
         )
@@ -474,7 +474,7 @@ def _resolve(session_id: str | None, cwd: str | Path | None, store: Store) -> De
         return Decision(
             False,
             f"off — {where} says ask{override}, and this session has not opted "
-            f"in; run `ezcl share on` to share this session",
+            f"in; run `ezup share on` to share this session",
             "repo",
             config,
         )
@@ -482,7 +482,7 @@ def _resolve(session_id: str | None, cwd: str | Path | None, store: Store) -> De
         return Decision(
             False,
             f"off — {where} says never{override}, so sessions under it are "
-            f"never shared and `ezcl share on` will refuse",
+            f"never shared and `ezup share on` will refuse",
             "repo",
             config,
         )
