@@ -17,8 +17,12 @@ Run exactly one of the following with the Bash tool, based on the first word:
   interactive picker for backfilling PAST sessions, so run it in the
   foreground and let the user drive it — do not pipe input into it, do not
   pick sessions for them.
-- `token` → run `ezup token mint --name "<rest of the arguments>"`. If no name
-  was given, ask who the token is for first — do not invent one.
+- `token show` → run `ezup token show`. It prints this machine's device token
+  — the login for the web viewer at the store URL. If its output warns that
+  this session is being shared, surface that warning prominently.
+- `token` (anything else) → run `ezup token mint --name "<rest of the
+  arguments>"`. If no name was given, ask who the token is for first — do not
+  invent one.
 
 Then relay the command's output to the user faithfully. Points that matter:
 

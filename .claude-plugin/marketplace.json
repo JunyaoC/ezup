@@ -10,7 +10,7 @@
       "name": "ezup",
       "description": "Opt a session in with /ezup on and its transcript syncs incrementally to your team store. Off by default; installing shares nothing.",
       "source": "./plugin",
-      "version": "0.2.2",
+      "version": "0.3.0",
       "category": "productivity",
       "tags": ["team", "changelog", "sync"]
     }

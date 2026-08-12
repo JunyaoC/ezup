@@ -891,6 +891,32 @@ def cmd_token(args: argparse.Namespace) -> int:
     """Reader-token management: a dev grants an operator read access."""
     store = _store_for(args)
     config = load_config(store, os.getcwd())
+
+    if args.token_command == "show":
+        # Needs no transport: the token lives in this machine's own config.
+        # The web viewer's "login" is this token, so a developer needs a way
+        # to retrieve their own. Reader tokens stay unrecoverable -- only
+        # their sha256 exists anywhere -- this shows the DEVICE token.
+        if not config.token:
+            print("no token configured; see the README's enrolment steps", file=sys.stderr)
+            return 1
+        lines = [
+            f"store  {config.store_url}",
+            f"token  {config.token}",
+            "",
+            "this is this machine's device token — it is the login for the",
+            f"web viewer at {config.store_url}. Treat it like a password.",
+        ]
+        decision = share.resolve(share.current_session_id(), os.getcwd(), store)
+        if decision.sharing:
+            lines.append(
+                "WARNING: this session is being SHARED right now; the token "
+                "just printed is going into the shared transcript. Consider "
+                "`ezup share off` first, then run this again."
+            )
+        _emit({"store": config.store_url, "token": config.token}, args.json, lines)
+        return 0
+
     try:
         transport = transport_for(config)
     except TransportError as error:
@@ -1287,6 +1313,11 @@ def build_parser() -> argparse.ArgumentParser:
     mint.add_argument("--name", required=True, help="who this token is for")
     mint.add_argument("--json", action="store_true")
     mint.set_defaults(func=cmd_token, token_command="mint")
+    show = token_sub.add_parser(
+        "show", help="show this machine's device token (your web viewer login)"
+    )
+    show.add_argument("--json", action="store_true")
+    show.set_defaults(func=cmd_token, token_command="show")
     listing = token_sub.add_parser("list", help="list tokens you have minted")
     listing.add_argument("--json", action="store_true")
     listing.set_defaults(func=cmd_token, token_command="list")

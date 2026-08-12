@@ -23,6 +23,8 @@
  * read-only -- they cannot write, delete, or mint further tokens.
  */
 
+import { VIEWER_HTML } from "./viewer";
+
 export interface Env {
   BUCKET: R2Bucket;
   DB: D1Database;
@@ -848,6 +850,21 @@ export default {
     // Everything, authentication and device minting included, runs inside this
     // try. A D1 outage during either used to escape as an unhandled rejection.
     try {
+      if (path === "/" && method === "GET") {
+        // The developer log viewer. The page itself is a static shell and
+        // carries no data; everything it shows comes through the same
+        // token-gated /v1 routes as the CLI, so serving it unauthenticated
+        // exposes nothing.
+        return new Response(VIEWER_HTML, {
+          headers: {
+            "content-type": "text/html; charset=utf-8",
+            "content-security-policy":
+              "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'",
+            "x-content-type-options": "nosniff",
+            "referrer-policy": "no-referrer",
+          },
+        });
+      }
       if (path === "/v1/device") {
         // The only route not gated by a device token: it is what mints them.
         return method === "POST"

@@ -122,6 +122,16 @@ The plugin is **inert without consent**: installing it shares nothing, and if
 `~/.local/bin`). Prefer no plugin? `ezup hook install` wires the same hooks
 into settings.json directly — use one or the other, not both.
 
+### Web viewer
+
+The store serves a read-only log viewer at its root URL — open your store
+(e.g. `https://<your-worker>.workers.dev`) in a browser. The login is your API
+key: `ezup token show` prints this machine's, or use a reader token an
+operator was given. A device key sees its own sessions, a reader key sees what
+it is scoped to — the page is a thin client over the same authed API the CLI
+uses, and the key never leaves the browser except as the Authorization header
+to that host.
+
 ## Start here
 
 ```bash
