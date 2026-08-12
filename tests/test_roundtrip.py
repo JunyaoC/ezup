@@ -176,17 +176,39 @@ class RoundTripTests(TransportTestCase):
         write_lines(self.transcript, 400)
         self.publish(max_chunk=8192)
 
-        # Drop the first range from the index, leaving a gap at byte 0.
+        # Drop a MIDDLE range, leaving a hole between published chunks.
         index = self.transport._load_index()
         record = index["sessions"][SESSION]
-        record["chunks"] = record["chunks"][1:]
+        self.assertGreater(len(record["chunks"]), 2)
+        dropped = record["chunks"].pop(1)
         self.transport._save_index(index)
 
         report = pull(self.view, self.pm_store)
 
         self.assertFalse(report.ok)
         self.assertTrue(any("gap" in error for error in report.errors), report.errors)
-        self.assertFalse(self.pulled.exists() and self.pulled.stat().st_size > 0)
+        # Only the contiguous head before the hole may exist locally.
+        have = self.pulled.stat().st_size if self.pulled.exists() else 0
+        self.assertLessEqual(have, dropped["offset"])
+
+    def test_a_leading_gap_is_a_consent_watermark_not_a_hole(self) -> None:
+        """Coverage starting above byte 0 is what `share on` mid-session
+        produces, so the puller must accept it and record the base -- refusing
+        it would break the opt-in watermark outright."""
+        write_lines(self.transcript, 400)
+        self.publish(max_chunk=8192)
+
+        index = self.transport._load_index()
+        record = index["sessions"][SESSION]
+        base = record["chunks"][1]["offset"]
+        record["chunks"] = record["chunks"][1:]
+        self.transport._save_index(index)
+
+        report = pull(self.view, self.pm_store)
+
+        self.assertTrue(report.ok, report.errors)
+        expected = self.transcript.read_bytes()[base:]
+        self.assertEqual(expected, self.pulled.read_bytes())
 
     def test_a_failed_session_holds_the_cursor_back(self) -> None:
         write_lines(self.transcript, 400)

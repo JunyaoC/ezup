@@ -1,5 +1,5 @@
 {
-  "description": "ezupdate session sync — inert until a session opts in with /ezupdate on",
+  "description": "ezup session sync — inert until a session opts in with /ezup on",
   "hooks": {
     "SessionStart": [
       {

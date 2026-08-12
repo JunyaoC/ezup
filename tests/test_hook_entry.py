@@ -129,14 +129,14 @@ class SharingOnTests(HookEntryTestCase):
         self.assertEqual(0, done.returncode, done.stderr)
         self.assertEqual("", done.stderr)
         message = json.loads(done.stdout)["systemMessage"]
-        self.assertIn("ezupdate is ON", message)
-        self.assertIn("ezcl share off", message)
+        self.assertIn("ezup is ON", message)
+        self.assertIn("ezup share off", message)
 
     def test_statusline_shows_the_indicator(self) -> None:
         done = self.run_hook(self.payload("Stop"), "statusline")
 
         self.assertEqual(0, done.returncode, done.stderr)
-        self.assertIn("ezupdate", done.stdout)
+        self.assertIn("ezup", done.stdout)
         self.assertIn("sharing", done.stdout)
 
 
@@ -175,4 +175,4 @@ class BrokenStoreTests(HookEntryTestCase):
         done = self.run_hook(self.payload("SessionStart"))
 
         self.assertEqual(0, done.returncode, done.stderr)
-        self.assertIn("ezupdate is ON", done.stdout)
+        self.assertIn("ezup is ON", done.stdout)

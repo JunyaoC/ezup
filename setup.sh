@@ -61,6 +61,7 @@ step "ezcl on PATH"
 # PATH; the venv alone is invisible to them.
 mkdir -p "$HOME/.local/bin"
 ln -sf "$HERE/.venv/bin/ezcl" "$HOME/.local/bin/ezcl"
+ln -sf "$HERE/.venv/bin/ezup" "$HOME/.local/bin/ezup"
 if command -v ezcl >/dev/null 2>&1; then
   ok "~/.local/bin/ezcl -> .venv/bin/ezcl"
 else

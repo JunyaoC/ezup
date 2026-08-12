@@ -1112,7 +1112,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     hook_parser = subparsers.add_parser(
         "hook",
-        help="wire ezupdate into ~/.claude/settings.json (installing shares nothing)",
+        help="wire ezup into ~/.claude/settings.json (installing shares nothing)",
     )
     hook_parser.add_argument(
         "action",

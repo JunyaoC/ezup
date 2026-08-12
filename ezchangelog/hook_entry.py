@@ -131,9 +131,9 @@ def _announce(decision: "Decision", cwd: str) -> str:
     project = project_name(cwd)
     target = store_url(decision) or "the team store"
     return (
-        f"ezupdate is ON for this session: the full transcript of your work in "
+        f"ezup is ON for this session: the full transcript of your work in "
         f"{project} is shared with {target}, including everything typed and "
-        f"everything printed by tools. Run `ezcl share off` to stop. Nothing "
+        f"everything printed by tools. Run `ezup share off` to stop. Nothing "
         f"from before now was shared."
     )
 
@@ -147,7 +147,7 @@ def statusline(payload: dict[str, Any]) -> str:
         decision = resolve(session_id, cwd, store)
         if not decision.sharing:
             return ""
-        return f"up ezupdate · {project_name(cwd)} · sharing"
+        return f"up ezup · {project_name(cwd)} · sharing"
     except Exception:
         return ""
 

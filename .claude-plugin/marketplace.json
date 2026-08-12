@@ -1,14 +1,14 @@
 {
   "name": "ez-change-log",
-  "description": "ezupdate — consent-gated Claude Code session sharing for teams",
+  "description": "ezup — consent-gated Claude Code session sharing for teams",
   "owner": {
     "name": "JunyaoC",
     "url": "https://github.com/JunyaoC"
   },
   "plugins": [
     {
-      "name": "ezupdate",
-      "description": "Opt a session in with /ezupdate on and its transcript syncs incrementally to your team store. Off by default; installing shares nothing.",
+      "name": "ezup",
+      "description": "Opt a session in with /ezup on and its transcript syncs incrementally to your team store. Off by default; installing shares nothing.",
       "source": "./plugin",
       "version": "0.1.0",
       "category": "productivity",

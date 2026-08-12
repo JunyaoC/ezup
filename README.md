@@ -100,26 +100,26 @@ There are no third-party dependencies; the venv exists for the entry point and
 a pinned interpreter, not for packages. If you skip setup entirely, `./collect`
 falls back to system `python3` and still works.
 
-## Team sharing (ezupdate) — as a Claude Code plugin
+## Team sharing (ezup) — as a Claude Code plugin
 
 The dev-side hook ships as a plugin. Install it from this repo:
 
 ```
 /plugin marketplace add JunyaoC/ez-change-log
-/plugin install ezupdate@ez-change-log
+/plugin install ezup@ez-change-log
 ```
 
 Then, inside any session you want to share:
 
 ```
-/ezupdate on        # this session only; nothing before now is sent
-/ezupdate status    # where bytes go, and why sharing is on or off
-/ezupdate off
+/ezup on        # this session only; nothing before now is sent
+/ezup status    # where bytes go, and why sharing is on or off
+/ezup off
 ```
 
 The plugin is **inert without consent**: installing it shares nothing, and if
 `ezcl` is not on PATH it does nothing at all (`./setup.sh` links it into
-`~/.local/bin`). Prefer no plugin? `ezcl hook install` wires the same hooks
+`~/.local/bin`). Prefer no plugin? `ezup hook install` wires the same hooks
 into settings.json directly — use one or the other, not both.
 
 ## Start here

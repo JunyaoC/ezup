@@ -410,8 +410,10 @@ def pull(
             row.get("last_ts")
         )
         before = len(report.errors)
-        written = _pull_one(transport, store, row, session, author, report)
         record = sessions_state.get(session)
+        written, base, generation = _pull_one(
+            transport, store, row, session, author, report, record
+        )
         # A partially written session is still incomplete even though the bytes
         # it did write are verified, so any error at all holds the cursor back.
         failed = written is None or len(report.errors) > before
@@ -423,7 +425,9 @@ def pull(
                 report.sessions_updated += 1
             # The record is written even after a partial failure: it records
             # what is genuinely on disk, which is what the next run resumes from.
-            sessions_state[session] = _session_record(store, row, session, author)
+            sessions_state[session] = _session_record(
+                store, row, session, author, base=base, generation=generation
+            )
 
         if failed:
             if updated_at is not None and (
@@ -446,7 +450,12 @@ def pull(
 
 
 def _session_record(
-    store: Store, row: dict[str, Any], session: str, author: str
+    store: Store,
+    row: dict[str, Any],
+    session: str,
+    author: str,
+    base: int = 0,
+    generation: str = "",
 ) -> dict[str, Any]:
     path = pulled_path_for(store, author, session)
     size = path.stat().st_size if path.is_file() else 0
@@ -462,6 +471,10 @@ def _session_record(
         "updated_at": row.get("updated_at"),
         "reported_size": row.get("size"),
         "offset": size,
+        # Where in the published document byte 0 of the local file sits. A
+        # consented session starts at its opt-in watermark, not at zero.
+        "base": base,
+        "generation": generation,
         "path": str(path),
         "pulled_at": isoformat(datetime.now(timezone.utc)),
     }
@@ -474,22 +487,24 @@ def _pull_one(
     session: str,
     author: str,
     report: PullReport,
-) -> int | None:
-    """Append this session's new bytes. Returns bytes written, or None on error."""
+    record: dict[str, Any] | None,
+) -> tuple[int | None, int, str]:
+    """Append this session's new bytes.
+
+    Returns ``(written, base, generation)`` -- written is None on error.
+    ``base`` is where the published document begins: a session shared mid-way
+    starts at its opt-in watermark, so the leading gap ``[0, base)`` is the
+    consent boundary, not missing data. Holes *between* chunks stay fatal.
+    """
     label = f"{author}/{session}"
     target = pulled_path_for(store, author, session)
     target.parent.mkdir(parents=True, exist_ok=True)
-
-    # The file on disk -- not the recorded offset -- is the authority on what
-    # we already hold. If a previous run died between appending and saving
-    # state, the state is stale and the file is still correct.
-    have = target.stat().st_size if target.is_file() else 0
 
     try:
         chunk_rows = transport.list_chunks(session)
     except Exception as exc:
         report.errors.append(f"{label}: listing chunks failed: {exc}")
-        return None
+        return None, 0, ""
 
     chunks, problems = _parse_chunks(
         chunk_rows if isinstance(chunk_rows, list) else [], session
@@ -497,17 +512,43 @@ def _pull_one(
     for problem in problems:
         report.errors.append(f"{label}: {problem}")
     if problems:
-        return None
+        return None, 0, ""
     if not chunks:
-        return 0
+        return 0, 0, ""
 
-    plan, gaps = _plan(chunks, have)
+    base = chunks[0].offset
+
+    # The file on disk -- not the recorded offset -- is the authority on what
+    # we already hold. If a previous run died between appending and saving
+    # state, the state is stale and the file is still correct.
+    have = target.stat().st_size if target.is_file() else 0
+
+    if have:
+        recorded_base = record.get("base", 0) if isinstance(record, dict) else 0
+        stale = None
+        if not isinstance(recorded_base, int) or recorded_base != base:
+            # The document's origin moved: a backfill extended coverage below
+            # the old watermark, or a reset re-published from scratch. Either
+            # way the local file's byte 0 no longer means what it did.
+            stale = "the published document now starts at a different offset"
+        else:
+            stale = _stale_reason(target, record, chunks, base, have)
+        if stale:
+            # Splicing across a generation would produce one document's head
+            # on another's tail; a refetch is cheap and provably right. Counted,
+            # not an error: holding the cursor back for a recovery that is
+            # about to succeed would re-list this session forever.
+            report.sessions_refetched += 1
+            target.unlink(missing_ok=True)
+            have = 0
+
+    plan, gaps = _plan(chunks, base + have)
     for gap in gaps:
         report.errors.append(f"{label}: {gap}")
     if gaps:
-        return None
+        return None, base, ""
     if not plan:
-        return 0
+        return 0, base, _generation_on_disk(chunks, base, have)
 
     written = 0
     with target.open("ab") as handle:
@@ -542,15 +583,32 @@ def _pull_one(
 
     final = target.stat().st_size if target.is_file() else 0
     reported = row.get("size")
-    if isinstance(reported, int) and final > reported:
+    # The session row reports the full document length; the local file holds
+    # only the bytes above the watermark, so the comparison is base-relative.
+    if isinstance(reported, int) and base + final > reported:
         report.errors.append(
-            f"{label}: reassembled {final} bytes but the session reports only "
-            f"{reported} -- the local copy may contain duplicated bytes"
+            f"{label}: reassembled {final} bytes above base {base} but the "
+            f"session reports only {reported} -- the local copy may contain "
+            f"duplicated bytes"
         )
-        return None
+        return None, base, ""
+    generation = _generation_on_disk(chunks, base, final)
     if written == 0:
-        return None if plan else 0
-    return written
+        return (None, base, "") if plan else (0, base, generation)
+    return written, base, generation
+
+
+def _generation_on_disk(chunks: list[_Chunk], base: int, size: int) -> str:
+    """Generation of exactly the prefix the local file holds.
+
+    Recorded per pull rather than over the whole chunk list, so a partial
+    fetch (network died mid-plan) still records a generation that matches what
+    is on disk, and the next run resumes instead of refetching.
+    """
+    if size <= 0:
+        return ""
+    prefix = _prefix_for(chunks, base, base + size)
+    return _generation(prefix) if prefix else ""
 
 
 # -- readback ----------------------------------------------------------------
